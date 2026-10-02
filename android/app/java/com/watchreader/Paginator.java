@@ -326,40 +326,47 @@ public final class Paginator {
         return Math.min(fit, remaining);
     }
 
-    /** 估算总页数：抽样 8 页取平均行数，再除总行数 */
+    /**
+     * 估算总页数：均匀取样若干页，按"平均每页覆盖多少字符"外推。
+     *
+     * 用字符而不是行数来外推 —— 行号在这里已不是权威单位（一行是一个段落，
+     * 会被折成多个视觉行），用行数外推会明显偏小。
+     * 这个值只用于底栏显示"第几页/共几页"，不参与任何定位计算。
+     */
     public static int estimatePageCount(Book book, TextPaint paint, int width, int height, float lineSpacingAdd) {
         if (book == null || book.index.length == 0) {
             return 1;
         }
+        int total = book.charCount();
+        if (total <= 0) {
+            return 1;
+        }
 
-        float lineHeight = lineHeightOf(paint, lineSpacingAdd);
-        int maxLines = Math.max(1, (int) Math.floor(height / Math.max(1f, lineHeight)));
-
-        // 一页最多覆盖多少"源行"（长段落会被拆行，所以用抽样实测）
-        long linesPerPage = 0;
-        int samples = 0;
+        final int samples = 8;
+        long charsSum = 0;
+        int counted = 0;
         int cursor = 0;
-        int step = Math.max(1, book.index.length / 8);
-        for (int i = 0; i < 8 && cursor < book.index.length; i++) {
-            Page page = paginate(book, paint, cursor, width, height, lineSpacingAdd);
-            if (page.lineCount() == 0) {
+        int step = Math.max(1, total / samples);
+        for (int i = 0; i < samples && cursor < total; i++) {
+            Measure m = measure(book, paint, cursor, width, height, lineSpacingAdd);
+            int span = m.endChar - m.startChar;
+            if (span <= 0) {
                 break;
             }
-            linesPerPage += page.endLine - page.startLine;
-            samples++;
-            cursor = page.endLine;
-            if (cursor >= book.index.length) {
-                break;
-            }
-            cursor = Math.min(book.index.length - 1, cursor + step);
+            charsSum += span;
+            counted++;
+            cursor += step;
         }
 
-        if (samples == 0 || linesPerPage == 0) {
-            return Math.max(1, (int) Math.ceil((double) book.index.length / maxLines));
+        if (counted == 0 || charsSum == 0) {
+            // 兜底：按页容量估一个下限
+            float lineHeight = lineHeightOf(paint, lineSpacingAdd);
+            int rows = Math.max(1, (int) Math.floor(height / Math.max(1f, lineHeight)));
+            return Math.max(1, (int) Math.ceil((double) total / Math.max(1, rows)));
         }
 
-        double avgLinesPerPage = (double) linesPerPage / samples;
-        return Math.max(1, (int) Math.ceil(book.index.length / avgLinesPerPage));
+        double avgCharsPerPage = (double) charsSum / counted;
+        return Math.max(1, (int) Math.ceil(total / avgCharsPerPage));
     }
 
     /**
