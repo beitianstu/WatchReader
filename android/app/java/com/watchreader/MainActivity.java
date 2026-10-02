@@ -460,8 +460,28 @@ public class MainActivity extends Activity {
         }
         try {
             String[] parts = raw.split("\\|");
-            // 格式：charOffset|pageIndex|percent。percent 存的是 0~100 的百分比
-            return parts.length >= 3 ? Float.parseFloat(parts[2]) * 100f : 0f;
+            // 格式：charOffset|pageIndex|percent
+            // 其中 percent 由 ReaderView.getPercent() 给出，本来就是 0~100 的百分数
+            //（75.35513 表示 75.36%）。**不能再乘 100** —— 之前乘了，
+            // 于是 75% 显示成 7536%（用户反馈"阅读进度完全不对"）。
+            float stored = parts.length >= 3 ? Float.parseFloat(parts[2]) : 0f;
+
+            // 更可靠的做法：用 offset / charCount 现算。
+            // 存下来的 percent 取自"页尾字符"，offset 取自"页首字符"，两者天然有零点几个百分点的差；
+            // 而 charCount 能从索引缓存头部读到（不加载整个索引）。
+            if (parts.length >= 1) {
+                int offset = Integer.parseInt(parts[0].trim());
+                int total = Book.cachedCharCount(indexDir(), file);
+                if (total > 0) {
+                    float byOffset = offset * 100f / total;
+                    return Math.max(0f, Math.min(100f, byOffset));
+                }
+            }
+
+            if (Float.isNaN(stored) || stored < 0f) {
+                return 0f;
+            }
+            return Math.min(100f, stored);
         } catch (Exception e) {
             return 0f;
         }

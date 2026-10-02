@@ -293,11 +293,18 @@ public class ReaderActivity extends Activity implements ReaderView.Listener {
         if (bookFile == null || readerView == null) {
             return;
         }
-        prefs.edit()
+        // 用 commit() 而不是 apply()：apply 是**异步**落盘，手表随时可能被系统杀掉，
+        // 那次写就可能还没写到磁盘就丢了（用户反馈"有时无法保存进度"）。
+        // 每页多花几毫秒换"一定落盘"，这个交易在手表上值得。
+        boolean ok = prefs.edit()
                 .putInt(progressOffsetKey(), lastOffset)
                 // 兼容书库列表：offset|page|percent
                 .putString(progressKey(), lastOffset + "|" + readerView.getPageIndex() + "|" + lastPercent)
-                .apply();
+                .commit();
+        if (!ok) {
+            // 用系统 tag：华为手表会丢弃未知 tag 的日志
+            android.util.Log.e("ActivityManager", "WatchReader saveProgress failed offset=" + lastOffset);
+        }
     }
 
     @Override

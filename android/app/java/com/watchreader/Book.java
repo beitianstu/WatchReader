@@ -91,6 +91,54 @@ public final class Book {
     }
 
     /**
+     * 只读索引缓存的头部，拿到正文长度（charCount），不加载整个索引。
+     *
+     * 书库列表要显示"读到百分之几"，最可靠的做法是 offset / charCount；
+     * 但在列表里为每本书调用 open() 会把大书的索引全读进内存（一本 2MB 小说的索引约 3MB），
+     * 明显不划算。缓存头部第三行就是 charCount，读几十字节即可。
+     *
+     * 缓存格式（见 writeCache）：
+     *   第 1 行  version|fileSize|mtime|encoding
+     *   第 2 行  charCount
+     *   第 3 行  indexCount
+     *
+     * @return 正文长度；缓存不存在、版本不符或文件已被替换时返回 -1
+     */
+    public static int cachedCharCount(File cacheDir, File book) {
+        if (cacheDir == null || book == null) {
+            return -1;
+        }
+        File cache = cacheFile(cacheDir, book);
+        if (!cache.isFile()) {
+            return -1;
+        }
+        try (java.io.BufferedReader reader = new java.io.BufferedReader(
+                new java.io.InputStreamReader(new java.io.FileInputStream(cache), StandardCharsets.UTF_8))) {
+            String header = reader.readLine();
+            if (header == null) {
+                return -1;
+            }
+            String[] parts = header.split("\\|");
+            if (parts.length < 3 || Integer.parseInt(parts[0]) != INDEX_VERSION) {
+                return -1;
+            }
+            // 头部里的 size/mtime 必须与当前文件一致，否则说明缓存已过期
+            if (Long.parseLong(parts[1]) != book.length()
+                    || Long.parseLong(parts[2]) != book.lastModified()) {
+                return -1;
+            }
+            String countLine = reader.readLine();
+            if (countLine == null) {
+                return -1;
+            }
+            int count = Integer.parseInt(countLine.trim());
+            return count > 0 ? count : -1;
+        } catch (Exception e) {
+            return -1;
+        }
+    }
+
+    /**
      * 打开一本书：能命中缓存就秒开，否则解码 + 建行索引并落盘。
      * 时间戳/大小对不上（文件被换过）会自动重建。
      */
