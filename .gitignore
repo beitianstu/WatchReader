@@ -1,0 +1,23 @@
+# 本项目现在只有一个安卓 App（android/），不再有 .NET 与 ArkTS 部分。
+
+# 安卓构建产物（APK / dex / 中间产物 / 调试截图）
+# 注意顺序：`!` 例外必须放在最后，否则会被前面的规则重新排除。
+android/build/apk/
+android/build/classes/
+android/build/dex/
+android/build/gen/
+android/build/res.zip
+android/build/*.log
+android/build/*.png
+android/build/*.txt
+android/build/*.xml
+android/.gradle/
+android/local.properties
+*.idsig
+
+# 签名密钥要保留 —— 换了密钥，覆盖安装会因签名不一致失败
+!android/build/debug.keystore
+
+# IDE
+.idea/
+*.iml

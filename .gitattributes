@@ -1,0 +1,18 @@
+# 换行符策略：仓库内统一存 LF，检出时由 Git 按平台处理。
+# 不这么定的话，Windows 上 git 默认 core.autocrlf=true 会把工作区的 LF 换成 CRLF，
+# 于是每次改一行都可能产生整文件 diff。
+* text=auto eol=lf
+
+# 二进制文件不要做任何换行转换
+*.png binary
+*.jpg binary
+*.keystore binary
+*.apk binary
+*.idsig binary
+*.zip binary
+*.dex binary
+*.class binary
+
+# 中文文件（含 UTF-8 BOM 的脚本）不要当成文本合并，避免把 BOM 弄丢
+*.ps1 -text
+*.bat -text
