@@ -21,3 +21,6 @@ android/local.properties
 # IDE
 .idea/
 *.iml
+
+# 交接文档：含本机环境/内网 IP/设备细节，不适合公开，只留在本地
+NEXT-STEPS.md
