@@ -6,20 +6,23 @@ import java.util.HashMap;
 import java.util.Map;
 
 /**
- * 精确页码映射（替代"用平均每页行数估算页码"的写法）。
+ * 精确页码映射（页码 ↔ 起始字符偏移）。
  *
- * 为什么需要它：
- *   每页覆盖的**源行数并不固定** —— 一个超长段落会在一页里被拆成十几行，而空行密集处
- *   一页也能放十几行。早先用 `pageIndex = 起始行 / 平均每页行数` 估算，快速连翻时
- *   误差会累积，表现就是"页码乱跳、跟内容对不上"。
+ * 为什么用字符偏移而不是行号：
+ *   早期版本用"行号"当页面主键，而 {@link Book#index} 的一行是一个**段落**；
+ *   长段落会被拆成多个视觉行，于是"本页消耗了多少视觉行"与"本页消耗了多少逻辑行"
+ *   并不相等。结果是一页正好在段落中间填满时，下一页会从"下一段"开始，
+ *   中间那段剩余文字**永远不渲染**（用户反馈："某页最后一行段落超过一行后，
+ *   第一行之后的内容会被截断"）。
  *
- * 实现要点（第一版在这里踩过坑，注释保留下来防止再犯）：
- *   · 页边界是**确定性**的：本页结束行 = 下一页起始行。
- *   · 向前/向后翻页时页码是明确的 ±1，直接从当前页推，不做任何估算。
- *   · 只有"跳到没访问过的页"（目录/百分比）才需要救援定位：
- *     先用锚点纠正估算，再邻页收敛。
- *   · **查"行→页码"必须用行区间比对，不能复用"页码→行"的结果** ——
- *     第一版就是拿 resolve(估算页) 返回的起始行当答案，导致第 8~18 行也被判成第 0 页。
+ *   改成字符偏移后：[startChar, endChar) 逐页首尾相接，
+ *   下一页的起点就是上一页的终点，**结构上不可能漏字或重叠**。
+ *
+ * 设计（相比旧版简单很多）：
+ *   · pageToStart / startToPage 都是精确映射，翻页 ±1 只是取相邻的起止字符；
+ *   · 不需要"平均每页行数"来估算页码，也不需要锚点纠正与邻页收敛 ——
+ *     那套救援逻辑存在的原因正是行号边界不可靠，现在根因没了；
+ *   · 查找未访问页（目录/百分比跳转）时，从已知起点或 0 开始顺序推进，最多滚到目标页。
  */
 final class PageMap {
 
@@ -28,20 +31,14 @@ final class PageMap {
     private final int width;
     private final int height;
     private final float spacingAdd;
+    private final int charCount;
 
-    /** 页码 → 起始行号 */
-    private final Map<Integer, Integer> pageToLine = new HashMap<>();
-    /** 行号 → 页码（已确定的行） */
-    private final Map<Integer, Integer> lineToPage = new HashMap<>();
-    /**
-     * 段落锚点：估算页号 → (真实页号 - 估算页号)。
-     * 相邻页的估算误差几乎相同，用最近锚点纠正命中率很高。
-     */
-    private final Map<Integer, Integer> anchors = new HashMap<>();
-
-    private final int totalLines;
-    /** 每页平均覆盖的源行数，仅用于给"救援定位"一个初值 */
-    private final int avgLinesPerPage;
+    /** 页码 → 起始字符偏移 */
+    private final Map<Integer, Integer> pageToStart = new HashMap<>();
+    /** 起始字符偏移 → 页码 */
+    private final Map<Integer, Integer> startToPage = new HashMap<>();
+    /** 页码 → 结束字符偏移（= 下一页起点），register 时顺便记下，翻页 O(1) */
+    private final Map<Integer, Integer> pageToEnd = new HashMap<>();
 
     PageMap(Book book, TextPaint paint, int width, int height, float spacingAdd) {
         this.book = book;
@@ -49,208 +46,166 @@ final class PageMap {
         this.width = width;
         this.height = height;
         this.spacingAdd = spacingAdd;
-        this.totalLines = book.index.length;
-        this.avgLinesPerPage = sampleLinesPerPage();
+        this.charCount = Math.max(1, book.charCount());
     }
 
-    /** 结果：行号 + 页码，两者一定自洽 */
+    /** 结果：起始字符偏移 + 页码，两者一定自洽 */
     static final class Loc {
-        final int line;
+        final int startChar;
         final int page;
 
-        Loc(int line, int page) {
-            this.line = line;
+        Loc(int startChar, int page) {
+            this.startChar = startChar;
             this.page = page;
         }
     }
 
-    private int sampleLinesPerPage() {
-        int cursor = 0;
-        long sum = 0;
-        int samples = 0;
-        for (int i = 0; i < 8 && cursor < totalLines; i++) {
-            int end = Paginator.pageEndLine(book, paint, cursor, width, height, spacingAdd);
-            if (end <= cursor) {
-                break;
-            }
-            sum += end - cursor;
-            samples++;
-            cursor = end;
-        }
-        if (samples == 0) {
-            return Math.max(1, (int) Math.floor(height / Math.max(1f,
-                    Paginator.lineHeightOf(paint, spacingAdd))));
-        }
-        return Math.max(1, (int) (sum / samples));
-    }
+    // ---------------- 查询 ----------------
 
-    int getAvgLinesPerPage() {
-        return avgLinesPerPage;
-    }
-
-    /** 已知页码时取起始行（翻页主路径，命中缓存即 O(1)） */
-    int lineOfPage(int pageIndex) {
-        Integer cached = pageToLine.get(pageIndex);
+    /** 已知页码 → 该页起始字符（未访问过的页会顺序推进解析出来） */
+    int startOfPage(int pageIndex) {
+        if (pageIndex <= 0) {
+            pageToStart.put(0, 0);
+            return 0;
+        }
+        Integer cached = pageToStart.get(pageIndex);
         if (cached != null) {
             return cached;
         }
-        if (pageIndex <= 0) {
-            pageToLine.put(0, 0);
-            return 0;
-        }
-        return resolvePage(pageIndex).line;
+        return resolvePage(pageIndex).startChar;
     }
 
-    /** 已知行号时取所属页（用行区间比对，绝不复用 page→line 的返回值） */
-    int pageOfLineKnown(int lineIndex) {
-        int line = clampLine(lineIndex);
-
-        Integer known = lineToPage.get(line);
-        if (known != null) {
-            return known;
+    /** 已知页码 → 该页结束字符（= 下一页起点） */
+    int endOfPage(int pageIndex) {
+        Integer cached = pageToEnd.get(pageIndex);
+        if (cached != null) {
+            return cached;
         }
-
-        return resolvePage(estimatePage(line)).page;
+        int start = startOfPage(pageIndex);
+        return Paginator.measure(book, paint, start, width, height, spacingAdd).endChar;
     }
 
     /**
-     * 定位到指定行：返回 (该行所属页的页码, 该页起始行)。
-     * 用于"恢复进度/跳转"这类需要同时知道页码和起点的场景。
+     * 已知字符偏移 → 它落在第几页。
+     * 做法：从缓存里找"起点 ≤ target 且最大"的已知页作为推进起点，再顺序推进到 target。
+     * 正常阅读路径（翻页/恢复进度）都有缓存命中，所以循环几乎不转。
      */
-    Loc locateLine(int lineIndex) {
-        int line = clampLine(lineIndex);
+    Loc locateChar(int charOffset) {
+        int target = clampChar(charOffset);
 
-        Integer known = lineToPage.get(line);
-        if (known != null) {
-            return new Loc(lineOfPage(known), known);
+        int bestPage = 0;
+        int bestStart = 0;
+        int bestStartSeen = -1;
+        for (Map.Entry<Integer, Integer> e : pageToStart.entrySet()) {
+            int start = e.getValue();
+            if (start <= target && start > bestStartSeen) {
+                bestStartSeen = start;
+                bestStart = start;
+                bestPage = e.getKey();
+            }
+        }
+        if (bestStartSeen < 0) {
+            register(0, 0);
         }
 
-        return resolvePage(estimatePage(line));
+        return advanceTo(bestPage, bestStart, target);
     }
 
-    /** 往前/往后翻一页：页码是确定的 ±1，不需要估算 */
-    Loc nextPage(int currentPage, int currentEndLine) {
-        int nextPage = currentPage + 1;
-        int start = clampLine(currentEndLine);
-        register(nextPage, start);
-        return new Loc(start, nextPage);
-    }
-
-    Loc prevPage(int currentPage, int currentStartLine) {
-        int prev = Math.max(0, currentPage - 1);
-        Integer cached = pageToLine.get(prev);
-        int start = cached != null ? cached : (prev == 0 ? 0 : resolvePage(prev).line);
-        if (start >= currentStartLine) {
-            start = Math.max(0, currentStartLine - 1);
-        }
-        register(prev, start);
-        return new Loc(start, prev);
-    }
-
-    /** 登记一页：把该页覆盖的行都登记成同一页码（长段落跨页时后写入的会覆盖成更靠后的页） */
-    void register(int pageIndex, int startLine) {
-        int start = clampLine(startLine);
-        pageToLine.put(pageIndex, start);
-        lineToPage.put(start, pageIndex);
-
-        int end = Paginator.pageEndLine(book, paint, start, width, height, spacingAdd);
-        for (int l = start; l < end && l < totalLines; l++) {
-            lineToPage.put(l, pageIndex);
-        }
-
-        int estimated = start / avgLinesPerPage;
-        anchors.put(estimated, pageIndex - estimated);
-    }
-
-    /** 返回的是"起始行落在该页"的那一页；同时把该页所有行登记好 */
-    private Loc resolvePage(int pageIndex) {
-        int target = Math.max(0, pageIndex);
-
-        Integer direct = pageToLine.get(target);
-        if (direct != null) {
-            return new Loc(direct, target);
-        }
-
-        int page = corrected(target);
-        // 只取缓存里的起点，取不到就从 0 开始向后滚 —— 绝不能在这里再调 resolvePage，
-        // 否则 resolvePage ↔ startOfKnownOrZero 会互相递归直接栈溢出（真踩过）。
-        int cursor = safeStartOf(page);
-
+    /** 从 (page, cursor) 顺序推进，直到覆盖 target；沿途把每页都登记下来 */
+    private Loc advanceTo(int page, int cursor, int target) {
         int guard = 0;
-        while (guard++ < 4096) {
-            if (page == target) {
-                register(page, cursor);
+        while (guard++ < 100000) {
+            Paginator.Measure m = Paginator.measure(book, paint, cursor, width, height, spacingAdd);
+            register(page, cursor);
+            if (m.endChar <= cursor || m.endChar > target) {
                 return new Loc(cursor, page);
             }
-            if (page < target) {
-                int end = Paginator.pageEndLine(book, paint, cursor, width, height, spacingAdd);
-                register(page, cursor);
-                if (end <= cursor) {
-                    // 已到全文末尾：把页码夹到最后一页，避免无限循环
-                    return new Loc(cursor, page);
-                }
-                cursor = end;
-                page++;
-            } else {
-                int back = Math.max(0, cursor - avgLinesPerPage);
-                int bGuard = 0;
-                while (back < cursor && bGuard++ < 128) {
-                    int end = Paginator.pageEndLine(book, paint, back, width, height, spacingAdd);
-                    if (end >= cursor) {
-                        break;
-                    }
-                    back = end;
-                }
-                if (back >= cursor) {
-                    return new Loc(cursor, page);
-                }
-                page--;
-                cursor = back;
-                register(page, cursor);
-            }
+            cursor = m.endChar;
+            page++;
         }
-        return new Loc(cursor, Math.max(0, page));
+        return new Loc(cursor, page);
     }
 
-    /** 纯粹的缓存查询：查不到就返回 0，绝不触发解析（防递归） */
-    private int safeStartOf(int pageIndex) {
-        if (pageIndex <= 0) {
+    /** 翻到下一页：页码 +1，起点 = 当前页终点（精确，无需估算） */
+    Loc nextPage(int currentPage, int currentEndChar) {
+        int next = currentPage + 1;
+        int start = clampChar(currentEndChar);
+        register(next, start);
+        return new Loc(start, next);
+    }
+
+    /**
+     * 翻到上一页：页码 −1。
+     * 往回推需要知道上一页的起点；缓存里没有时从 0 顺序推进到 prev（页数多时是 O(页)，
+     * 但只在"没访问过的页往回翻"时发生，正常阅读路径都有缓存）。
+     */
+    Loc prevPage(int currentPage, int currentStartChar) {
+        int prev = Math.max(0, currentPage - 1);
+        Integer cached = pageToStart.get(prev);
+        if (cached != null && cached < currentStartChar) {
+            return new Loc(cached, prev);
+        }
+        if (prev == 0) {
+            register(0, 0);
+            return new Loc(0, 0);
+        }
+        Loc loc = resolvePage(prev);
+        if (loc.startChar >= currentStartChar) {
+            // 兜底：解析结果不合法（不该发生），退到全文开头
+            register(0, 0);
+            return new Loc(0, 0);
+        }
+        return loc;
+    }
+
+    // ---------------- 登记与解析 ----------------
+
+    /** 登记一页：记下起点与终点（终点即下一页起点） */
+    void register(int pageIndex, int startChar) {
+        if (pageIndex < 0) {
+            return;
+        }
+        int start = clampChar(startChar);
+        pageToStart.put(pageIndex, start);
+        startToPage.put(start, pageIndex);
+        Paginator.Measure m = Paginator.measure(book, paint, start, width, height, spacingAdd);
+        int end = Math.max(m.endChar, start + 1);
+        pageToEnd.put(pageIndex, Math.min(end, charCount));
+    }
+
+    /** 从 0 开始顺序推进到目标页 */
+    private Loc resolvePage(int target) {
+        if (target <= 0) {
+            register(0, 0);
+            return new Loc(0, 0);
+        }
+        int page = 0;
+        int cursor = 0;
+        int guard = 0;
+        while (page < target && guard++ < 100000) {
+            Paginator.Measure m = Paginator.measure(book, paint, cursor, width, height, spacingAdd);
+            register(page, cursor);
+            if (m.endChar <= cursor) {
+                // 已到末尾，页码夹到最后一页
+                return new Loc(cursor, page);
+            }
+            cursor = m.endChar;
+            page++;
+        }
+        register(page, cursor);
+        return new Loc(cursor, page);
+    }
+
+    private int clampChar(int value) {
+        if (value < 0) {
             return 0;
         }
-        Integer cached = pageToLine.get(pageIndex);
-        return cached != null ? cached : 0;
-    }
-
-    private int corrected(int pageIndex) {
-        int bestEstimate = -1;
-        int bestDelta = 0;
-        for (Map.Entry<Integer, Integer> e : anchors.entrySet()) {
-            int estimate = e.getKey();
-            if (estimate <= pageIndex && estimate > bestEstimate) {
-                bestEstimate = estimate;
-                bestDelta = e.getValue();
-            }
-        }
-        if (bestEstimate < 0) {
-            return Math.max(0, pageIndex);
-        }
-        return Math.max(0, pageIndex + bestDelta);
-    }
-
-    private int estimatePage(int line) {
-        return Math.max(0, line / avgLinesPerPage);
-    }
-
-    private int clampLine(int line) {
-        if (line < 0) {
-            return 0;
-        }
-        return Math.min(line, Math.max(0, totalLines - 1));
+        return Math.min(value, charCount - 1);
     }
 
     void clear() {
-        pageToLine.clear();
-        anchors.clear();
-        lineToPage.clear();
+        pageToStart.clear();
+        startToPage.clear();
+        pageToEnd.clear();
     }
 }

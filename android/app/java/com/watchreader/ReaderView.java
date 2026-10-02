@@ -245,7 +245,7 @@ public class ReaderView extends View {
             pendingStart = charOffset;
             return;
         }
-        loadPage(Paginator.lineOfChar(book, charOffset));
+        loadPage(charOffset);
     }
 
     /** 显式跳转（目录/百分比） */
@@ -254,7 +254,7 @@ public class ReaderView extends View {
             return;
         }
         ensureMetrics(getWidth(), getHeight());
-        loadPage(Paginator.lineOfChar(book, charOffset));
+        loadPage(charOffset);
     }
 
     private int pendingStart = -1;
@@ -265,7 +265,7 @@ public class ReaderView extends View {
         }
         int anchor = current == null ? 0 : current.startChar;
         ensureMetrics(getWidth(), getHeight());
-        loadPage(Paginator.lineOfChar(book, anchor));
+        loadPage(anchor);
     }
 
     // ---------------- 几何 / 字体 ----------------
@@ -337,9 +337,9 @@ public class ReaderView extends View {
 
     // ---------------- 页面装载 ----------------
 
-    /** 用已知行号装载（页码由 PageMap 反查） */
-    private void loadPage(int lineIndex) {
-        loadPage(lineIndex, -1);
+    /** 用已知起始字符装载（页码由 PageMap 反查） */
+    private void loadPage(int startChar) {
+        loadPage(startChar, -1);
     }
 
     /**
@@ -348,7 +348,7 @@ public class ReaderView extends View {
      * @param knownPageIndex 已知页码时传进来（翻页的 ±1 路径），避免再反查；
      *                       传 -1 表示"未知页码"，交给 PageMap 精确求解。
      */
-    private void loadPage(int lineIndex, int knownPageIndex) {
+    private void loadPage(int startChar, int knownPageIndex) {
         ensureMetrics(getWidth(), getHeight());
         if (book == null || textWidth <= 0 || textHeight <= 0) {
             android.util.Log.e(LOG_TAG, "WatchReader loadPage skip: book=" + (book != null)
@@ -361,7 +361,7 @@ public class ReaderView extends View {
                 chapters = findChapters(book.text);
             }
 
-            Paginator.Page page = Paginator.paginate(book, bodyPaint, lineIndex,
+            Paginator.Page page = Paginator.paginateAt(book, bodyPaint, startChar,
                     (int) textWidth, (int) textHeight, lineSpacingAdd);
             current = page;
             estimatedPages = Paginator.estimatePageCount(book, bodyPaint,
@@ -371,11 +371,11 @@ public class ReaderView extends View {
             if (map != null) {
                 if (knownPageIndex >= 0) {
                     pageIndex = knownPageIndex;
-                    map.register(pageIndex, page.startLine);
+                    map.register(pageIndex, page.startChar);
                 } else {
-                    PageMap.Loc loc = map.locateLine(page.startLine);
+                    PageMap.Loc loc = map.locateChar(page.startChar);
                     pageIndex = loc.page;
-                    map.register(pageIndex, page.startLine);
+                    map.register(pageIndex, page.startChar);
                 }
             } else {
                 pageIndex = 0;
@@ -414,39 +414,23 @@ public class ReaderView extends View {
 
         PageMap map = pageMap();
         if (forward) {
-            // 行索引越界 = 已经是最后一页
-            if (current.startLine >= book.index.length - 1) {
+            // 本页终点已经是全文末尾 = 最后一页
+            if (current.endChar >= book.charCount()) {
                 return;
             }
-            PageMap.Loc next = map.nextPage(pageIndex, current.endLine);
-            if (next.line == current.startLine) {
+            // 页码 +1，起点 = 本页终点（字符精确衔接，不会漏字）
+            PageMap.Loc next = map.nextPage(pageIndex, current.endChar);
+            if (next.startChar <= current.startChar) {
                 return;
             }
-            // 页码明确是 +1，直接告诉 loadPage，免得再反查出错
-            loadPage(next.line, next.page);
+            loadPage(next.startChar, next.page);
         } else {
-            if (current.startLine <= 0) {
+            if (current.startChar <= 0) {
                 return;
             }
-            PageMap.Loc prev = map.prevPage(pageIndex, current.startLine);
-            loadPage(prev.line, prev.page);
+            PageMap.Loc prev = map.prevPage(pageIndex, current.startChar);
+            loadPage(prev.startChar, prev.page);
         }
-    }
-
-    /** 原来的反向翻页实现（保留注释说明为什么换掉）：
-     *  "从当前位置往前估一屏再局部校正"在长短段落交替时会跳错页，
-     *  现在改为用 PageMap 精确取上一页的起始行。 */
-    @SuppressWarnings("unused")
-    private void flipBackwardOld() {
-        if (book == null || current == null) {
-            return;
-        }
-        if (current.startLine <= 0) {
-            return;
-        }
-        int span = Math.max(1, current.endLine - current.startLine);
-        int target = Math.max(0, current.startLine - span);
-        loadPage(target);
     }
 
     private void reportProgress() {
@@ -474,7 +458,7 @@ public class ReaderView extends View {
         resetPageMap();
         int anchor = pendingStart >= 0 ? pendingStart : (current == null ? 0 : current.startChar);
         pendingStart = -1;
-        loadPage(Paginator.lineOfChar(book, anchor));
+        loadPage(anchor);
     }
 
     @Override

@@ -54,56 +54,129 @@ public final class Paginator {
 
     /**
      * 只算"这一页到哪里结束"（返回结束行号，不含）。
-     * 与 {@link #paginate} 用同一套几何，供 PageMap 精确页码映射复用，
-     * 避免两处各写一份"一页能放几行"导致页码与内容对不上。
+     *
+     * 注意语义已经改为**字符偏移驱动**：内部先算出本页结束的字符位置，
+     * 再映射回行号。早期版本直接返回 `起始行 + 视觉行数`，而视觉行数（长段落会被
+     * 拆成多行）与逻辑行数并不相等，于是长段落被切开时会把"下一行"整段跳过
+     * —— 用户反馈的"某页最后一行段落超过一行后，后面的内容被截断"就是这个。
      */
     public static int pageEndLine(Book book, TextPaint paint, int lineIndex,
                                   int width, int height, float lineSpacingAdd) {
         if (book == null || book.index.length == 0 || width <= 0 || height <= 0) {
             return Math.max(0, lineIndex);
         }
+        int line = Math.max(0, Math.min(lineIndex, book.index.length - 1));
+        int startChar = book.index[line][0];
+        Measure m = measure(book, paint, startChar, width, height, lineSpacingAdd);
+        if (m.endChar <= startChar) {
+            return line + 1;
+        }
+        // 结束字符所处（或其后一条）逻辑行
+        int endLine = lineWithChar(book, m.endChar);
+        return Math.max(line + 1, endLine);
+    }
+
+    /** 分页测量的结果：本页覆盖 [startChar, endChar) */
+    public static final class Measure {
+        public final int startChar;
+        public final int endChar;
+        public final int rowCount;
+
+        Measure(int startChar, int endChar, int rowCount) {
+            this.startChar = startChar;
+            this.endChar = endChar;
+            this.rowCount = rowCount;
+        }
+    }
+
+    /** 包含 character 的逻辑行号（character 越界时返回最后一行） */
+    public static int lineWithChar(Book book, int character) {
+        if (book == null || book.index.length == 0) {
+            return 0;
+        }
+        int lo = 0;
+        int hi = book.index.length - 1;
+        int best = 0;
+        while (lo <= hi) {
+            int mid = (lo + hi) >>> 1;
+            if (book.index[mid][0] <= character) {
+                best = mid;
+                lo = mid + 1;
+            } else {
+                hi = mid - 1;
+            }
+        }
+        return best;
+    }
+
+    /**
+     * 从任意字符位置开始，量出"能放进 width × height 的一段"。
+     * 这是分页的唯一真相来源：返回的 endChar 就是下一页的 startChar，
+     * 因此页面之间**结构上不可能漏字或重叠**。
+     */
+    public static Measure measure(Book book, TextPaint paint, int startChar,
+                                  int width, int height, float lineSpacingAdd) {
+        if (book == null || book.index.length == 0 || width <= 0 || height <= 0) {
+            return new Measure(startChar, startChar, 0);
+        }
+        int charCount = book.charCount();
+        int from = Math.max(0, Math.min(startChar, Math.max(0, charCount - 1)));
 
         float lineHeight = lineHeightOf(paint, lineSpacingAdd);
         if (lineHeight <= 0) {
             lineHeight = 1f;
         }
-        int maxLines = (int) Math.floor(height / lineHeight);
-        if (maxLines < 1) {
-            maxLines = 1;
-        }
+        int maxRows = Math.max(1, (int) Math.floor(height / lineHeight));
 
-        int from = Math.max(0, Math.min(lineIndex, book.index.length - 1));
-        int count = 0;
+        int line = lineWithChar(book, from);
+        int cursor = from;
+        int rows = 0;
+        int guard = 0;
 
-        while (count < maxLines && from + count < book.index.length) {
-            int idx = from + count;
-            int[] range = book.index[idx];
-            String source = book.text.substring(range[0], range[1]);
+        while (rows < maxRows && line < book.index.length && guard++ < maxRows * 4 + 64) {
+            int[] range = book.index[line];
+            int lineStart = range[0];
+            int lineEnd = range[1];
 
-            int offset = 0;
-            boolean produced = false;
-            while (offset < source.length() && count < maxLines) {
-                int fit = fitChars(paint, source, offset, width);
+            // 起点可能落在本行中间（上一页把这一行切开了）
+            int offset = Math.max(cursor, lineStart);
+            if (offset >= lineEnd) {
+                // 空行：占一行
+                cursor = lineEnd;
+                rows++;
+                line++;
+                continue;
+            }
+
+            String source = book.text;
+            int produced = 0;
+            while (offset < lineEnd && rows < maxRows) {
+                int fit = fitChars(paint, source, offset, lineEnd, width);
                 if (fit <= 0) {
                     fit = 1;
                 }
-                int end = offset + fit;
-                if (end < source.length() && end > offset + 1
-                        && NO_LINE_START.indexOf(source.charAt(end)) >= 0) {
+                int end = Math.min(offset + fit, lineEnd);
+                // 避头尾：断点落在"不能放行首"的标点上时回退一格
+                if (end < lineEnd && end > offset + 1 && NO_LINE_START.indexOf(source.charAt(end)) >= 0) {
                     end--;
                 }
-                count++;
-                produced = true;
+                cursor = end;
+                rows++;
+                produced++;
                 offset = end;
             }
 
-            if (!produced && count < maxLines) {
-                count++;
+            if (produced == 0 && rows < maxRows) {
+                // 兜底：本行一个字符都放不下也不能死循环
+                cursor = lineEnd;
+                rows++;
             }
+            line++;
         }
 
-        return from + count;
+        return new Measure(from, cursor, rows);
     }
+
 
     private static final Page EMPTY = new Page(0, 0, 0, 0, new int[0], new String[0]);
 
@@ -123,77 +196,98 @@ public final class Paginator {
      * @param width     可用宽度 px
      * @param height    可用高度 px
      */
+    /**
+     * 取"从某一逻辑行开始"的一页（行号入口，内部仍按字符位置推进）。
+     * 需要精确续页时用 {@link #paginateAt}，它接受任意字符位置。
+     */
     public static Page paginate(Book book, TextPaint paint, int lineIndex,
                                 int width, int height, float lineSpacingAdd) {
         if (book == null || book.index.length == 0 || width <= 0 || height <= 0) {
             return EMPTY;
         }
+        int line = Math.max(0, Math.min(lineIndex, book.index.length - 1));
+        return paginateAt(book, paint, book.index[line][0], width, height, lineSpacingAdd);
+    }
 
-        float lineHeight = lineHeightOf(paint, lineSpacingAdd);
-        if (lineHeight <= 0) {
-            lineHeight = 1f;
-        }
-        int maxLines = (int) Math.floor(height / lineHeight);
-        if (maxLines < 1) {
-            maxLines = 1;
-        }
-
-        int from = Math.max(0, Math.min(lineIndex, book.index.length - 1));
-        int[] starts = new int[maxLines];
-        String[] texts = new String[maxLines];
-        int count = 0;
-        int lastIndex = from;
-
-        while (count < maxLines && from + count < book.index.length) {
-            int idx = from + count;
-            int[] range = book.index[idx];
-            String source = book.text.substring(range[0], range[1]);
-
-            // 多行（长段落）：行内会拆成若干视觉行
-            int offset = 0;
-            boolean produced = false;
-            while (offset < source.length() && count < maxLines) {
-                int fit = fitChars(paint, source, offset, width);
-                if (fit <= 0) {
-                    fit = 1;
-                }
-                int end = offset + fit;
-
-                // 避头尾：如果断点落在"不能放行首"的标点上，回退一格
-                if (end < source.length() && end > offset + 1 && NO_LINE_START.indexOf(source.charAt(end)) >= 0) {
-                    end--;
-                }
-
-                starts[count] = range[0] + offset;
-                texts[count] = source.substring(offset, end);
-                count++;
-                lastIndex = idx;
-                produced = true;
-                offset = end;
-            }
-
-            if (!produced && count < maxLines) {
-                // 空行：占一行
-                starts[count] = range[0];
-                texts[count] = "";
-                count++;
-                lastIndex = idx;
-            }
-        }
-
-        if (count == 0) {
+    /**
+     * 取"从字符位置 startChar 开始"的一页。
+     *
+     * 这是分页的主入口：页面以**字符区间**为界，[startChar, endChar)。
+     * 下一页直接用上一页的 endChar 当 startChar，因此长段落被切开时
+     * 剩下的部分一定会在下一页渲染，不会丢（这是"段落超一行后内容被截断"的根治点）。
+     */
+    public static Page paginateAt(Book book, TextPaint paint, int startChar,
+                                  int width, int height, float lineSpacingAdd) {
+        if (book == null || book.index.length == 0 || width <= 0 || height <= 0) {
             return EMPTY;
         }
 
-        int[] finalStarts = new int[count];
-        String[] finalTexts = new String[count];
-        System.arraycopy(starts, 0, finalStarts, 0, count);
-        System.arraycopy(texts, 0, finalTexts, 0, count);
+        Measure m = measure(book, paint, startChar, width, height, lineSpacingAdd);
+        if (m.endChar <= m.startChar) {
+            return EMPTY;
+        }
 
-        int startChar = finalStarts[0];
-        int endChar = lastIndex + 1 < book.index.length ? book.index[lastIndex + 1][0] : book.charCount();
+        int count = Math.max(1, m.rowCount);
+        int[] starts = new int[count];
+        String[] texts = new String[count];
 
-        return new Page(from, lastIndex + 1, startChar, endChar, finalStarts, finalTexts);
+        // 按视觉行逐行切出文本（与 measure 用同一套 fitChars，保证边界一致）
+        int line = lineWithChar(book, m.startChar);
+        int cursor = m.startChar;
+        int row = 0;
+        int guard = 0;
+        int lastEnd = m.startChar;
+
+        while (row < count && cursor < m.endChar && line < book.index.length
+                && guard++ < count * 4 + 64) {
+            int[] range = book.index[line];
+            int lineStart = range[0];
+            int lineEnd = Math.min(range[1], m.endChar);
+
+            int offset = Math.max(cursor, lineStart);
+            if (offset >= lineEnd) {
+                // 空行
+                starts[row] = lineStart;
+                texts[row] = "";
+                row++;
+                cursor = Math.max(cursor, lineStart);
+                line++;
+                continue;
+            }
+            while (offset < lineEnd && row < count) {
+                int fit = fitChars(paint, book.text, offset, lineEnd, width);
+                if (fit <= 0) {
+                    fit = 1;
+                }
+                int end = Math.min(offset + fit, lineEnd);
+                if (end < lineEnd && end > offset + 1 && NO_LINE_START.indexOf(book.text.charAt(end)) >= 0) {
+                    end--;
+                }
+                starts[row] = offset;
+                texts[row] = book.text.substring(offset, end);
+                row++;
+                cursor = end;
+                lastEnd = Math.max(lastEnd, end);
+                offset = end;
+            }
+            line++;
+        }
+
+        if (row == 0) {
+            return EMPTY;
+        }
+
+        int[] finalStarts = new int[row];
+        String[] finalTexts = new String[row];
+        System.arraycopy(starts, 0, finalStarts, 0, row);
+        System.arraycopy(texts, 0, finalTexts, 0, row);
+
+        int pageStart = finalStarts[0];
+        // 结束位置以 measure 为准（它决定了下一页从哪里开始），文本可能因避头尾回退而略短，
+        // 回退掉的那些字会在下一页开头出现，不会丢。
+        int pageEnd = Math.max(m.endChar, lastEnd);
+
+        return new Page(pageStart, pageEnd, pageStart, pageEnd, finalStarts, finalTexts);
     }
 
     /** 当前字号下的行高（含行间距） */
@@ -203,27 +297,28 @@ public final class Paginator {
     }
 
     /**
-     * 一行能放下多少字符：优先用 breakText 精确测量，
-     * 标签类字符（`<p>`）按 0 宽处理，避免空白虚高。
+     * 从 offset 开始、最多到 end，一行能放下多少字符（返回字符数）。
+     * 直接用整段正文 + 区间测量，避免为每一行都 substring 出一份拷贝。
      */
-    private static int fitChars(TextPaint paint, String line, int offset, int width) {
-        int remaining = line.length() - offset;
+    private static int fitChars(TextPaint paint, CharSequence text, int offset, int end, int width) {
+        int remaining = end - offset;
         if (remaining <= 0) {
             return 0;
         }
 
-        int fit = paint.breakText(line, offset, line.length(), true, width, null);
+        int fit = paint.breakText(text, offset, end, true, width, null);
         if (fit <= 0) {
             fit = 1;
         }
 
         // breakText 对超长行可能低估（返回 0 或很小），兜底用平均字宽估算
         if (fit == 1 && remaining > 1) {
-            float avg = paint.measureText(line, offset, Math.min(offset + 8, line.length())) / Math.min(8, remaining);
+            int probe = Math.min(8, remaining);
+            float avg = paint.measureText(text, offset, offset + probe) / probe;
             if (avg > 0) {
                 int byAvg = (int) (width / avg);
                 if (byAvg > fit) {
-                    fit = Math.min(byAvg, remaining);
+                    fit = byAvg;
                 }
             }
         }
