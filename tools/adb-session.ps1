@@ -14,8 +14,11 @@ param(
     [ValidateSet('start', 'stop', 'status')]
     [string]$Action = 'start',
 
-    [string]$Adb = 'D:\Android\android-sdk\platform-tools\adb.exe',
-    [string]$Target = '192.168.3.213:5555',
+    # 同理不叫 $Adb：点源会覆盖调用方的 $Adb。
+    [string]$AdbPath = '',
+    # 注意：这个参数**不能叫 $Target** —— 点源本脚本时 param 会绑定到调用方作用域，
+    # 把调用方的 $Target 强制成 [string]，从而导致 $list[0] 变成字符串首字符（实测踩过）。
+    [string]$Device = '',
 
     # 保持亮屏的时长（毫秒）。手表电池供电时系统仍可能熄屏，所以给得大些；
     # App 自己也会在阅读页用 FLAG_KEEP_SCREEN_ON。
@@ -30,9 +33,12 @@ param(
     [switch]$RestoreWifiPolicy
 )
 
+. (Join-Path $PSScriptRoot 'env.ps1')
 # 脚本级变量：点源时在同一会话内复用
-$script:SessionAdb = $Adb
-$script:SessionTarget = $Target
+if (-not $Device) { $Device = Get-WrEnv 'Target' }
+if (-not $AdbPath) { $AdbPath = Get-WrEnv 'Adb' }
+$script:SessionAdb = $AdbPath
+$script:SessionTarget = $Device
 $script:SessionTimeoutMs = $ScreenOffTimeoutMs
 $script:SessionQuiet = [bool]$Quiet
 $script:sessionStateFile = Join-Path $env:TEMP 'watchreader-adb-session.json'
@@ -55,11 +61,10 @@ function Test-SessionConnected {
     if (-not (Test-Path $script:SessionAdb)) { throw "找不到 adb：$($script:SessionAdb)" }
 
     for ($i = 1; $i -le $Retries; $i++) {
-        $dev = (& $script:SessionAdb devices 2>&1) | Select-String $script:SessionTarget
-        # 注意 "offline" 也算在列但不可用，必须排除
-        if ($dev -and ($dev -notmatch 'offline')) { return $true }
+        $state = Get-WrDeviceState $script:SessionAdb $script:SessionTarget
+        if ($state -eq 'device') { return $true }
 
-        if ($dev -match 'offline') {
+        if ($state -eq 'offline') {
             Session-Say "设备处于 offline，重新连接（第 $i/$Retries 次）..." 'Yellow'
             & $script:SessionAdb disconnect $script:SessionTarget 2>&1 | Out-Null
             Start-Sleep -Seconds 1
@@ -71,12 +76,10 @@ function Test-SessionConnected {
         Start-Sleep -Seconds $RetryDelaySec
     }
 
-    $dev = (& $script:SessionAdb devices 2>&1) | Select-String $script:SessionTarget
-    if ($dev -and ($dev -notmatch 'offline')) { return $true }
+    if ((Get-WrDeviceState $script:SessionAdb $script:SessionTarget) -eq 'device') { return $true }
 
-    throw ("设备不可用：{0}`n  排查顺序：`n    1) 抬起手腕点亮手表（息屏后 Wi-Fi 可能已断）`n    2) 下拉快捷开关确认 Wi-Fi 是开着的`n    3) 确认手表与本机在同一网段（本机: 192.168.3.251）`n    4) 必要时重新执行：& .\tools\adb-session.ps1 start" -f $script:SessionTarget)
+    throw ("设备不可用：{0}`n  排查顺序：`n    1) 抬起手腕点亮手表（息屏后 Wi-Fi 可能已断）`n    2) 下拉快捷开关确认 Wi-Fi 是开着的`n    3) 确认手表与本机在同一网段`n    4) 必要时重新执行：& .\tools\adb-session.ps1 start" -f $script:SessionTarget)
 }
-
 function Read-SessionOrigin {
     if (-not (Test-Path $script:sessionStateFile)) { return $null }
     return (Get-Content $script:sessionStateFile -Raw -Encoding UTF8 | ConvertFrom-Json)

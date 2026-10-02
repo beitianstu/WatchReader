@@ -48,13 +48,43 @@ W/PackageInstaller: InstallStart:try to install in watch, not allow install unkn
 
 ---
 
+## 一之二、环境准备（脚本会自动找，也可显式指定）
+
+工具脚本不再写死某一台机器的路径，按 **环境变量 → 常见安装位置 → 明确报错** 的顺序解析：
+
+| 需要的东西 | 环境变量 | 说明 |
+| --- | --- | --- |
+| Android SDK | `ANDROID_HOME` 或 `ANDROID_SDK_ROOT` | 需含 `platform-tools/adb.exe`、`build-tools`、`platforms` |
+| JDK | `JAVA_HOME` | d8 / apksigner 需要 JDK 11 或 17 |
+| 手表地址 | `WATCH_ADB_TARGET` | 无线调试地址，形如 `192.168.1.23:5555` |
+
+```powershell
+$env:ANDROID_HOME     = 'D:\Android\android-sdk'
+$env:JAVA_HOME        = 'C:\Program Files\Java\jdk-17'
+$env:WATCH_ADB_TARGET = '192.168.1.23:5555'
+```
+
+也可以逐次传参覆盖，例如：
+
+```powershell
+& .\tools\build-apk.ps1 -Sdk 'D:\sdk' -JdkHome 'C:\jdk17'
+& .\tools\install-apk.ps1 -Apk 'D:\out\app.apk' -Target '192.168.1.23:5555'
+```
+
+找不到依赖时会直接打印解决办法（而不是抛一段看不懂的异常）。
+
 ## 二、快速开始
 
 ```powershell
-cd C:\Users\fan18\RiderProjects\WatchReader
+cd <本项目目录>
 
-# 1) 连手表（无线 ADB；IP 换成你手表实际的）
-& 'D:\Android\android-sdk\platform-tools\adb.exe' connect 192.168.3.213:5555
+# 0) 只做一次：设好环境变量（见上一节）
+$env:ANDROID_HOME     = '<你的 Android SDK>'
+$env:JAVA_HOME        = '<你的 JDK 17>'
+$env:WATCH_ADB_TARGET = '<手表 IP>:5555'
+
+# 1) 连手表（无线调试需先在手表开发者选项里打开"无线调试"）
+& .\tools\adb-session.ps1 start
 
 # 2) 构建 APK（无需 Gradle：aapt2 → javac → d8 → zipalign → apksigner）
 & .\tools\build-apk.ps1
@@ -63,7 +93,7 @@ cd C:\Users\fan18\RiderProjects\WatchReader
 & .\tools\install-apk.ps1
 
 # 4) 启动
-& 'D:\Android\android-sdk\platform-tools\adb.exe' shell am start -n com.watchreader/.MainActivity
+adb shell am start -n com.watchreader/.MainActivity
 ```
 
 ---

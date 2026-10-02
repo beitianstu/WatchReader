@@ -99,7 +99,7 @@
 ## 快速自检命令
 
 ```powershell
-cd C:\Users\fan18\RiderProjects\WatchReader
+cd <本项目目录>
 
 # 连接 + 开始保持会话（亮屏 + Wi-Fi 不休眠）
 & .\tools\adb-session.ps1 start

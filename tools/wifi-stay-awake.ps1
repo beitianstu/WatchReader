@@ -14,14 +14,20 @@
 param(
     [ValidateSet(0, 1, 2)]
     [int]$Policy = 2,
-    [string]$Adb = 'D:\Android\android-sdk\platform-tools\adb.exe',
-    [string]$Target = '192.168.3.213:5555',
+    [string]$Adb = '',
+    [string]$Target = '',
     [switch]$Verify
 )
 
 $ErrorActionPreference = 'Continue'
 
-if (-not (Test-Path $Adb)) { throw "找不到 adb：$Adb" }
+. (Join-Path $PSScriptRoot 'env.ps1')
+
+if (-not $Adb) { $Adb = Get-WrEnv 'Adb' }
+if (-not $Target) { $Target = Get-WrEnv 'Target' }
+try { Assert-WrAdb $Adb | Out-Null } catch { Write-Host $_.Exception.Message -ForegroundColor Red; return }
+
+try { Assert-WrAdb $Adb | Out-Null } catch { Write-Host $_.Exception.Message -ForegroundColor Red; return }
 
 function Invoke-OnDevice([string]$command) {
     return (& $Adb -s $Target shell $command 2>&1)

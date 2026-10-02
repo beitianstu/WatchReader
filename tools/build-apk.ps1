@@ -7,20 +7,39 @@
 #
 # 注意：华为 Watch3/4 系列默认禁止 ADB 安装第三方应用，
 #      装机前必须先冻结应用安装器（详见 tools\install-apk.ps1）。
+#
+# SDK / JDK / adb 的位置由 tools\env.ps1 自动解析
+# （环境变量 ANDROID_HOME / JAVA_HOME → 常见安装位置 → 报错提示），
+# 也可以用下面的参数显式指定。
 param(
-    [string]$Sdk = 'D:\Android\android-sdk',
-    [string]$JdkHome = 'D:\Android\openjdk\jdk-17.0.8.101-hotspot',
+    [string]$Sdk = '',
+    [string]$JdkHome = '',
     [string]$CompileSdk = 'android-33',
     [int]$MinSdk = 29,
     [int]$TargetSdk = 29,
-    [string]$Adb = 'D:\Android\android-sdk\platform-tools\adb.exe',
+    [string]$Adb = '',
     [switch]$Install,
     [switch]$Release
 )
 
+. (Join-Path $PSScriptRoot 'env.ps1')
+
 # 外部工具（keytool/javac/d8）会把正常提示写到 stderr，
 # 在 PS 5.1 下会被当成 error 并触发 Stop 而中断，所以只用 Continue，逐步检查 $LASTEXITCODE。
 $ErrorActionPreference = 'Continue'
+
+# 解析并校验外部依赖（参数优先，其次环境变量/探测）
+if (-not $Sdk) { $Sdk = Get-WrEnv 'Sdk' }
+if (-not $JdkHome) { $JdkHome = Get-WrEnv 'JdkHome' }
+if (-not $Adb) { $Adb = Get-WrEnv 'Adb' }
+try {
+    Assert-WrSdk $Sdk | Out-Null
+    Assert-WrJdk $JdkHome | Out-Null
+    Assert-WrAdb $Adb | Out-Null
+} catch {
+    Write-Host $_.Exception.Message -ForegroundColor Red
+    return
+}
 
 $projectRoot = [System.IO.Path]::GetFullPath((Join-Path $PSScriptRoot '..\android'))
 $appDir = Join-Path $projectRoot 'app'

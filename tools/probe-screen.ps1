@@ -1,12 +1,18 @@
 ﻿# 读取手表当前屏幕状态 + 测量菜单面板几何（防御式，不会因为未找到面板而刷屏）
 # 用法： & .\tools\probe-screen.ps1
 param(
-    [string]$Adb = 'D:\Android\android-sdk\platform-tools\adb.exe',
-    [string]$Target = '192.168.3.213:5555',
+    [string]$Adb = '',
+    [string]$Target = '',
     [switch]$NoShot
 )
 
 $ErrorActionPreference = 'Continue'
+
+. (Join-Path $PSScriptRoot 'env.ps1')
+
+if (-not $Adb) { $Adb = Get-WrEnv 'Adb' }
+if (-not $Target) { $Target = Get-WrEnv 'Target' }
+try { Assert-WrAdb $Adb | Out-Null } catch { Write-Host $_.Exception.Message -ForegroundColor Red; return }
 Add-Type -AssemblyName System.Drawing
 
 function OnDevice([string]$c) { return (& $Adb -s $Target shell $c 2>&1) }

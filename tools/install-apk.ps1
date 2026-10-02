@@ -11,21 +11,27 @@
 #   & .\tools\install-apk.ps1                                  # 用默认 APK
 #   & .\tools\install-apk.ps1 -Apk D:\x\y.apk -Target 192.168.1.5:5555
 param(
-    [string]$Apk = 'C:\Users\fan18\RiderProjects\WatchReader\android\build\apk\WatchReader.apk',
-    [string]$Adb = 'D:\Android\android-sdk\platform-tools\adb.exe',
+    [string]$Apk = '',
+    [string]$Adb = '',
     [string]$Target = '',
     [switch]$SkipUnfreeze
 )
 
 $ErrorActionPreference = 'Continue'
 
+. (Join-Path $PSScriptRoot 'env.ps1')
+
+if (-not $Adb) { $Adb = Get-WrEnv 'Adb' }
+if (-not $Apk) { $Apk = Get-WrEnv 'Apk' }
+try { Assert-WrAdb $Adb | Out-Null } catch { Write-Host $_.Exception.Message -ForegroundColor Red; return }
+
 if (-not (Test-Path $Apk)) { throw "找不到 APK：$Apk" }
 if (-not (Test-Path $Adb)) { throw "找不到 adb：$Adb" }
 
 if (-not $Target) {
-    $devices = & $Adb devices | Select-String -Pattern '\tdevice' | ForEach-Object { ($_ -split '\s+')[0] }
-    if (-not $devices) { throw "没有已连接的设备（先 adb connect <IP>:5555）" }
-    $Target = $devices[0]
+    $list = Get-WrDeviceList $Adb
+    if (-not $list -or $list.Count -eq 0) { throw "没有已连接的设备（先 adb connect <IP>:5555）" }
+    $Target = $list[0]
 }
 Write-Host "目标设备：$Target" -ForegroundColor Cyan
 

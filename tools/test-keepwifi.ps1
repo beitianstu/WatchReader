@@ -1,12 +1,25 @@
 ﻿# 自动验证"息屏保持 Wi-Fi"开关：唤醒 → 进阅读页 → 开菜单 → 点开关 → 校验锁与状态
+#
+# 注意：菜单点击的"痕迹"来自 ReaderView.logCrownDiag 写出的 files/crown-trace.log。
+# 正式包默认关闭该开关（logCrownDiag=false），此时本脚本的"菜单触摸诊断"一栏会是空的，
+# 但开关本身的翻转结论仍然有效（看 prefs 里的 keepWifiOnScreenOff 与系统的锁统计）。
+# 需要看逐次点击轨迹时，先把 ReaderView.logCrownDiag 改成 true 重新构建安装。
 # 依赖：tools\probe-screen.ps1 用的同一套几何推算
 param(
-    [string]$Adb = 'D:\Android\android-sdk\platform-tools\adb.exe',
-    [string]$Target = '192.168.3.213:5555',
-    [int]$WifiRowIndex = 3
+    [string]$Adb = '',
+    [string]$Target = '',
+    # 注意行号是 0-based：设置菜单里「息屏保持 Wi-Fi」是第 5 项 → index 4
+    # （调大字号 0 / 调小字号 1 / 切换字体 2 / 目录 3 / 息屏保持 Wi-Fi 4 / 按百分比跳转 5 / 返回书库 6）
+    [int]$WifiRowIndex = 4
 )
 
 $ErrorActionPreference = 'Continue'
+
+. (Join-Path $PSScriptRoot 'env.ps1')
+
+if (-not $Adb) { $Adb = Get-WrEnv 'Adb' }
+if (-not $Target) { $Target = Get-WrEnv 'Target' }
+try { Assert-WrAdb $Adb | Out-Null } catch { Write-Host $_.Exception.Message -ForegroundColor Red; return }
 Add-Type -AssemblyName System.Drawing
 
 function OnDevice([string]$c) { return (& $Adb -s $Target shell $c 2>&1) }
