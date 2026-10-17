@@ -70,7 +70,10 @@ function Step([string]$name) {
 
 # 清理
 foreach ($d in @($genDir, $classesDir, $dexDir, $apkDir)) {
-    if (Test-Path $d) { Remove-Item -Recurse -Force $d }
+    $resolvedBuild=[IO.Path]::GetFullPath($buildDir).TrimEnd('\')+'\'
+    $resolvedTarget=[IO.Path]::GetFullPath($d)
+    if(-not $resolvedTarget.StartsWith($resolvedBuild,[StringComparison]::OrdinalIgnoreCase)){throw 'Build cleanup target escapes android/build'}
+    if (Test-Path -LiteralPath $resolvedTarget) { Remove-Item -LiteralPath $resolvedTarget -Recurse -Force }
     New-Item -ItemType Directory -Force -Path $d | Out-Null
 }
 
@@ -83,7 +86,8 @@ if (-not (Test-Path $keystore)) {
     if ($LASTEXITCODE -ne 0) { throw "keytool 生成签名库失败" }
 }
 
-$sourceFiles = Get-ChildItem -Path (Join-Path $appDir 'java') -Filter '*.java' -Recurse |
+$hostSources = @((Join-Path $appDir 'java'),(Join-Path $PSScriptRoot '..\fanqie\api\java'),(Join-Path $PSScriptRoot '..\fanqie\host\java'))
+$sourceFiles = Get-ChildItem -Path $hostSources -Filter '*.java' -Recurse |
     Select-Object -ExpandProperty FullName
 if ($sourceFiles.Count -eq 0) { throw "没有找到任何 .java 源文件" }
 
@@ -96,7 +100,11 @@ if ($LASTEXITCODE -ne 0) { throw "aapt2 compile 失败" }
 
 # 2) 链接资源 + 生成 R.java
 Step "aapt2 link（生成 R.java 与基础 APK）"
-$manifest = Join-Path $appDir 'AndroidManifest.xml'
+$manifestSource = Join-Path $appDir 'AndroidManifest.xml'
+$manifest = Join-Path $buildDir 'AndroidManifest.xml'
+$manifestText = Get-Content -LiteralPath $manifestSource -Raw -Encoding UTF8
+if($Release){$manifestText=$manifestText.Replace('android:debuggable="true"','android:debuggable="false"')}
+[IO.File]::WriteAllText($manifest,$manifestText,[Text.UTF8Encoding]::new($false))
 $baseApk = Join-Path $apkDir 'base.apk'
 $linkArgs = @(
     'link',
@@ -106,8 +114,8 @@ $linkArgs = @(
     '--java', $genDir,
     '--min-sdk-version', "$MinSdk",
     '--target-sdk-version', "$TargetSdk",
-    '--version-code', '1',
-    '--version-name', '1.0'
+    '--version-code', '4',
+    '--version-name', '1.2'
 )
 # debuggable 只能写在 AndroidManifest 里（aapt2 link 没有这个选项）
 $linkArgs += $compiledRes
@@ -126,7 +134,9 @@ if ($LASTEXITCODE -ne 0) { throw "javac 编译失败" }
 # 4) dex
 Step "d8 生成 dex"
 $classFiles = Get-ChildItem -Path $classesDir -Filter '*.class' -Recurse | Select-Object -ExpandProperty FullName
-& $d8 --min-api $MinSdk --output $dexDir --lib $androidJar @classFiles
+& (Join-Path $JdkHome 'bin\jar.exe') cf (Join-Path $buildDir 'classes.jar') -C $classesDir .
+if($LASTEXITCODE -ne 0){throw 'Class archive failed'}
+& $d8 --min-api $MinSdk --output $dexDir --lib $androidJar (Join-Path $buildDir 'classes.jar')
 if ($LASTEXITCODE -ne 0) { throw "d8 失败" }
 
 # 5) 把 dex 打进 APK

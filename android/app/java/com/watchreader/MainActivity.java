@@ -4,7 +4,6 @@ import android.Manifest;
 import android.app.Activity;
 import android.app.AlertDialog;
 import android.content.Intent;
-import android.content.IntentFilter;
 import android.content.SharedPreferences;
 import android.content.pm.PackageManager;
 import android.graphics.Color;
@@ -109,34 +108,6 @@ public class MainActivity extends Activity {
         prefs = getSharedPreferences("watchreader", MODE_PRIVATE);
         buildUi();
         askPermissionThenScan();
-
-        // 调试通道：adb 可直接开关"息屏保持 Wi-Fi"，便于确定性验证
-        keepWifiReceiver = new android.content.BroadcastReceiver() {
-            @Override
-            public void onReceive(android.content.Context context, android.content.Intent intent) {
-                if (!ReaderActivity.ACTION_SET_KEEPWIFI.equals(intent.getAction())) {
-                    return;
-                }
-                boolean on = intent.getBooleanExtra("on", !KeepAwake.isEnabled(context));
-                KeepAwake.setEnabled(context, on);
-                KeepAwake.sync(context);
-                android.util.Log.e("ActivityManager", "WR keepWifi=" + (on ? 1 : 0)
-                        + " held=" + (KeepAwake.isHeld() ? 1 : 0));
-            }
-        };
-        IntentFilter f = new IntentFilter(ReaderActivity.ACTION_SET_KEEPWIFI);
-        registerReceiver(keepWifiReceiver, f);
-    }
-
-    private android.content.BroadcastReceiver keepWifiReceiver;
-
-    @Override
-    protected void onDestroy() {
-        super.onDestroy();
-        try {
-            unregisterReceiver(keepWifiReceiver);
-        } catch (Throwable ignored) {
-        }
     }
 
     @Override
@@ -197,6 +168,14 @@ public class MainActivity extends Activity {
         bar.addView(fonts, new LinearLayout.LayoutParams(ViewGroup.LayoutParams.WRAP_CONTENT,
                 ViewGroup.LayoutParams.WRAP_CONTENT));
         root.addView(bar);
+
+        Button plugins = new Button(this);
+        plugins.setText("番茄插件 · 在线书架 / 下载");
+        plugins.setTextSize(12f);
+        plugins.setAllCaps(false);
+        plugins.setOnClickListener(v -> startActivity(new Intent(this, com.watchreader.fanqie.FanqieActivity.class)));
+        root.addView(plugins, new LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT,
+                ViewGroup.LayoutParams.WRAP_CONTENT));
 
         listView = new ListView(this);
         listView.setDivider(null);
@@ -284,15 +263,10 @@ public class MainActivity extends Activity {
     }
 
     private void showBookMenu(Book.Candidate candidate) {
-        Book book = null;
-        try {
-            book = Book.open(candidate.file, indexDir());
-        } catch (Exception e) {
-            Toast.makeText(this, "打开失败：" + e.getMessage(), Toast.LENGTH_LONG).show();
-            return;
-        }
-
-        final Book opened = book;
+        // F5：这里**不再** Book.open()。旧实现为了在对话框标题显示书名，就在 UI 线程
+        // 整本解码 + 建行索引（首次打开 2MB 小说 0.6~0.7s，大书更久），有 ANR 风险；
+        // 而书名用 parseName 就够了。
+        final String title = Book.parseName(candidate.file.getName())[0];
         String[] items = new String[] {
                 "开始阅读",
                 "从第一页开始",
@@ -300,25 +274,25 @@ public class MainActivity extends Activity {
                 "删除这本书的文件",
         };
         new AlertDialog.Builder(this)
-                .setTitle(opened.title)
+                .setTitle(title)
                 .setItems(items, (dialog, which) -> {
                     switch (which) {
                         case 0:
                             openBook(candidate);
                             break;
                         case 1:
-                            prefs.edit().remove(progressKey(candidate.file)).apply();
+                            clearProgress(candidate.file);
                             openBook(candidate);
                             break;
                         case 2:
-                            prefs.edit().remove(progressKey(candidate.file)).apply();
+                            clearProgress(candidate.file);
                             scan();
                             Toast.makeText(this, "已清除进度", Toast.LENGTH_SHORT).show();
                             break;
                         case 3:
                             if (candidate.file.delete()) {
                                 deleteIndex(candidate.file);
-                                prefs.edit().remove(progressKey(candidate.file)).apply();
+                                clearProgress(candidate.file);
                                 scan();
                                 Toast.makeText(this, "已删除", Toast.LENGTH_SHORT).show();
                             } else {
@@ -332,11 +306,23 @@ public class MainActivity extends Activity {
                 .show();
     }
 
+    /**
+     * F2：进度有两个键 —— `progress.<id>`（offset|page|percent，书库列表显示用）
+     * 和 `progress.<id>.offset`（ReaderActivity 恢复位置时真正读的那个）。
+     * 只删其中一个会出现"删了进度却仍然续读"/"从第一页开始却回到旧位置"。
+     */
+    private void clearProgress(File file) {
+        String key = progressKey(file);
+        prefs.edit().remove(key).remove(key + ".offset").apply();
+    }
+
     private void deleteIndex(File file) {
         File idx = new File(indexDir(), Book.cacheId(file) + ".idx");
         if (idx.isFile()) {
             idx.delete();
         }
+        // 行索引与页码缓存一起删（页码缓存 keyed by size/mtime，本来也不会误用，删掉更干净）
+        PageIndexCache.delete(indexDir(), file);
     }
 
     private void openBook(Book.Candidate candidate) {

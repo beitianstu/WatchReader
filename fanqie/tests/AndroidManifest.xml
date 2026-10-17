@@ -1,0 +1,8 @@
+<manifest xmlns:android="http://schemas.android.com/apk/res/android" package="com.watchreader.fanqie.tests">
+    <uses-sdk android:minSdkVersion="29" android:targetSdkVersion="29" />
+    <supports-screens android:smallScreens="true" android:normalScreens="true" android:largeScreens="true" android:xlargeScreens="true" android:anyDensity="true" android:resizeable="true" />
+    <application android:label="Fanqie tests" />
+    <instrumentation android:name="com.watchreader.fanqie.PluginInstrumentation" android:targetPackage="com.watchreader.fanqie" />
+    <instrumentation android:name="com.watchreader.fanqie.ProgressUiInstrumentation" android:targetPackage="com.watchreader.fanqie" />
+    <instrumentation android:name="com.watchreader.fanqie.LibraryUiInstrumentation" android:targetPackage="com.watchreader.fanqie" />
+</manifest>

@@ -95,7 +95,7 @@ public final class Book {
      *
      * 书库列表要显示"读到百分之几"，最可靠的做法是 offset / charCount；
      * 但在列表里为每本书调用 open() 会把大书的索引全读进内存（一本 2MB 小说的索引约 3MB），
-     * 明显不划算。缓存头部第三行就是 charCount，读几十字节即可。
+     * 明显不划算。缓存头部第二行就是 charCount，读几十字节即可。
      *
      * 缓存格式（见 writeCache）：
      *   第 1 行  version|fileSize|mtime|encoding
@@ -105,6 +105,20 @@ public final class Book {
      * @return 正文长度；缓存不存在、版本不符或文件已被替换时返回 -1
      */
     public static int cachedCharCount(File cacheDir, File book) {
+        int count = readCachedCharCount(cacheDir, book);
+        return count > 0 ? count : -1;
+    }
+
+    /**
+     * 只读缓存头部，快速判断"这次打开能不能复用已建索引"。
+     * 用于加载提示如实显示阶段（复用索引 vs 首次建索引），不读索引与正文。
+     */
+    public static boolean hasFreshCache(File cacheDir, File book) {
+        return readCachedCharCount(cacheDir, book) >= 0;
+    }
+
+    /** @return 头部里的正文长度；缓存不存在/版本不符/文件已变/损坏时返回 -1 */
+    private static int readCachedCharCount(File cacheDir, File book) {
         if (cacheDir == null || book == null) {
             return -1;
         }
@@ -131,11 +145,23 @@ public final class Book {
             if (countLine == null) {
                 return -1;
             }
-            int count = Integer.parseInt(countLine.trim());
-            return count > 0 ? count : -1;
+            return Integer.parseInt(countLine.trim());
         } catch (Exception e) {
             return -1;
         }
+    }
+
+    /** {@link #open(File, File, LoadListener)} 回调的阶段 */
+    public enum LoadPhase {
+        /** 缓存头部有效，本次会复用已建索引（通常很快） */
+        FROM_CACHE,
+        /** 需要解码 + 重建索引（首次打开、书变了、缓存坏了） */
+        BUILD_INDEX
+    }
+
+    /** 加载阶段回调：让界面显示真实阶段，而不是永远写"正在建立索引" */
+    public interface LoadListener {
+        void onPhase(LoadPhase phase);
     }
 
     /**
@@ -143,13 +169,31 @@ public final class Book {
      * 时间戳/大小对不上（文件被换过）会自动重建。
      */
     public static Book open(File file, File cacheDir) throws IOException {
+        return open(file, cacheDir, null);
+    }
+
+    /**
+     * 带阶段回调的打开。
+     *
+     * 回调会先根据**缓存头部**给出预期阶段（复用/重建）；若头部看着有效、真正解析时
+     * 才发现损坏，会再补一次 BUILD_INDEX —— 界面提示因此始终与实际做的工作一致。
+     */
+    public static Book open(File file, File cacheDir, LoadListener listener) throws IOException {
         long size = file.length();
         long mtime = file.lastModified();
         File cache = cacheFile(cacheDir, file);
 
+        boolean freshHeader = hasFreshCache(cacheDir, file);
+        if (listener != null) {
+            listener.onPhase(freshHeader ? LoadPhase.FROM_CACHE : LoadPhase.BUILD_INDEX);
+        }
+
         Book cached = tryLoadCache(file, cache, size, mtime);
         if (cached != null) {
             return cached;
+        }
+        if (listener != null && freshHeader) {
+            listener.onPhase(LoadPhase.BUILD_INDEX);
         }
 
         long started = System.currentTimeMillis();
@@ -188,23 +232,32 @@ public final class Book {
                 return null;
             }
 
-            // 第 1 遍：单遍扫出每行起始（3MB 缓存一次扫完，比逐行 readLine 快得多）
-            int[] starts = new int[Math.min(400000, raw.length / 8 + 8)];
-            int lineCountTotal = 1;
-            starts[0] = 0;
+            // 第 1 遍：数出 '\n' 个数，按**实际行数**分配行起点表（F7）。
+            // 旧实现写死 40 万行上限：段落行数多的书（约 >20 万行）缓存永远读不出来，
+            // 每次打开都整本重建。行数天然上界是 raw.length（每行至少 1 字节），
+            // 所以既不按"文件大小"乱估，也不会因为文件大就误判。
+            int newlines = 0;
             for (int i = 0; i < raw.length; i++) {
                 if (raw[i] == '\n') {
-                    if (lineCountTotal < starts.length) {
-                        starts[lineCountTotal] = i + 1;
-                    }
-                    lineCountTotal++;
+                    newlines++;
+                }
+            }
+            int lineCountTotal = newlines + 1;          // 末尾可能还有半行
+            if (lineCountTotal > raw.length) {          // 只可能来自损坏的缓存
+                logCacheMiss("缓存行数异常(" + lineCountTotal + " > " + raw.length + "B)");
+                return null;
+            }
+
+            // 第 2 遍：单遍扫出每行起始（比逐行 readLine 快得多）
+            int[] starts = new int[lineCountTotal + 1];  // +1 给哨兵
+            starts[0] = 0;
+            int lineNo = 1;
+            for (int i = 0; i < raw.length; i++) {
+                if (raw[i] == '\n') {
+                    starts[lineNo++] = i + 1;
                 }
             }
             // 末尾补一个哨兵，方便统一用 (starts[k], starts[k+1]-1) 取第 k 行
-            if (lineCountTotal >= starts.length) {
-                logCacheMiss("缓存行数超出预期上限");
-                return null;
-            }
             starts[lineCountTotal] = raw.length;
 
             // 第 0 行：版本|大小|时间戳|编码
@@ -309,25 +362,27 @@ public final class Book {
 
     private static void writeCache(File cache, Book book) {
         File tmp = new File(cache.getAbsolutePath() + ".tmp");
-        try (FileOutputStream out = new FileOutputStream(tmp)) {
-            StringBuilder sb = new StringBuilder(book.text.length() / 4 + 1024);
-            sb.append(INDEX_VERSION).append('|').append(book.size).append('|').append(book.mtime)
-              .append('|').append(book.encoding).append('\n');
-            sb.append(book.text.length()).append('\n');
-            sb.append(book.index.length).append('\n');
-            for (int[] line : book.index) {
-                sb.append(line[0]).append('\t').append(line[1]).append('\n');
+        try {
+            // 先写临时文件并**关闭流**：Windows 上文件流未关闭时 rename/delete 会失败
+            // （旧的实现把 rename 放在 try-with-resources 里面，于是桌面环境永远写不出缓存，
+            //   而且先删旧缓存、失败后连旧缓存也没了 —— F12/A1）。
+            try (FileOutputStream out = new FileOutputStream(tmp)) {
+                StringBuilder sb = new StringBuilder(book.text.length() / 4 + 1024);
+                sb.append(INDEX_VERSION).append('|').append(book.size).append('|').append(book.mtime)
+                  .append('|').append(book.encoding).append('\n');
+                sb.append(book.text.length()).append('\n');
+                sb.append(book.index.length).append('\n');
+                for (int[] line : book.index) {
+                    sb.append(line[0]).append('\t').append(line[1]).append('\n');
+                }
+                sb.append("###TEXT###\n").append(book.text);
+                out.write(sb.toString().getBytes(StandardCharsets.UTF_8));
+                out.flush();
             }
-            sb.append("###TEXT###\n").append(book.text);
-            out.write(sb.toString().getBytes(StandardCharsets.UTF_8));
-            out.flush();
-            // 原子替换：避免掉电写出半个索引
-            if (cache.exists() && !cache.delete()) {
-                return;
-            }
-            if (!tmp.renameTo(cache)) {
-                tmp.delete();
-            }
+            // 原子替换：REPLACE_EXISTING 直接覆盖目标，不先删旧缓存，
+            // 于是"新缓存没装上、旧缓存也没了"的窗口不存在。
+            java.nio.file.Files.move(tmp.toPath(), cache.toPath(),
+                    java.nio.file.StandardCopyOption.REPLACE_EXISTING);
         } catch (Exception e) {
             tmp.delete();
         }
@@ -355,21 +410,22 @@ public final class Book {
         return text.length() - lastEnd <= 4;
     }
 
-    /** 规范化：换行统一 \n、去 BOM/NUL，连续 3 个以上空行压成 2 个 */
+    /** 规范化：换行统一 \n（LF/CRLF 同样处理）、去 BOM/NUL，连续 3 个以上空行压成 2 个 */
     public static String normalize(String raw) {
         StringBuilder sb = new StringBuilder(raw.length());
         int blankStreak = 0;
         for (int i = 0; i < raw.length(); i++) {
             char c = raw.charAt(i);
+            boolean newline = (c == '\n');
             if (c == '\r') {
+                // CRLF 与单个 CR 都当换行，并且要和 '\n' 走同一套空行压缩计数（M1）：
+                // 旧实现在这里把 blankStreak 清零，于是 CRLF 文件的连续空行完全不被压缩。
+                newline = true;
                 if (i + 1 < raw.length() && raw.charAt(i + 1) == '\n') {
                     i++;
                 }
-                sb.append('\n');
-                blankStreak = 0;
-                continue;
             }
-            if (c == '\n') {
+            if (newline) {
                 blankStreak++;
                 if (blankStreak <= 2) {
                     sb.append('\n');

@@ -65,5 +65,5 @@ if ($after -eq "$Policy") {
     Write-Host "  3) 等 45 秒后再取一次：数字不变 = Wi-Fi 没有休眠" -ForegroundColor DarkGray
 } else {
     Write-Warning "写入未生效（当前 $after）。可能是 adb shell 缺少 WRITE_SECURE_SETTINGS 权限。"
-    Write-Host "备选：用 App 内 WifiLock 保持（需在 App 里申请并持有），或换用有权限的 adb。" -ForegroundColor Yellow
+    Write-Host "备选：换用有权限的 adb（App 内 WifiLock 已因真机无效而移除）。" -ForegroundColor Yellow
 }

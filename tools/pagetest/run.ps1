@@ -1,4 +1,4 @@
-﻿# 在桌面上运行分页无缝性测试（不需要手表、不需要模拟器）
+# 在桌面上运行分页无缝性测试（不需要手表、不需要模拟器）
 #
 #   & .\tools\pagetest\run.ps1
 #
@@ -36,19 +36,27 @@ $sources = @(
     (Join-Path $srcDir 'com\watchreader\Book.java'),
     (Join-Path $srcDir 'com\watchreader\Paginator.java'),
     (Join-Path $srcDir 'com\watchreader\PageMap.java'),
-    (Join-Path $stubDir 'java\com\watchreader\PaginateCheck.java')
+    (Join-Path $srcDir 'com\watchreader\PageIndexCache.java'),
+    (Join-Path $stubDir 'java\com\watchreader\PaginateCheck.java'),
+    (Join-Path $stubDir 'java\com\watchreader\BoundaryCheck.java'),
+    (Join-Path $stubDir 'java\com\watchreader\BookCheck.java')
 )
 & $javac -encoding UTF-8 -nowarn -d $out $sources
 if ($LASTEXITCODE -ne 0) { Write-Host "编译失败" -ForegroundColor Red; return }
 
-Write-Host "==> 2/2 运行" -ForegroundColor Cyan
-& $java "-Dfile.encoding=UTF-8" -cp $out com.watchreader.PaginateCheck
-$code = $LASTEXITCODE
+Write-Host "==> 2/2 运行（PaginateCheck + BoundaryCheck + BookCheck）" -ForegroundColor Cyan
+$code = 0
+foreach ($cls in @('PaginateCheck', 'BoundaryCheck', 'BookCheck')) {
+    Write-Host ""
+    Write-Host "---- $cls ----" -ForegroundColor DarkGray
+    & $java "-Dfile.encoding=UTF-8" -Xmx1g -cp $out "com.watchreader.$cls"
+    if ($LASTEXITCODE -ne 0) { $code = 1 }
+}
 
 Write-Host ""
 if ($code -eq 0) {
-    Write-Host "分页测试通过 ✓" -ForegroundColor Green
+    Write-Host "分页/书库测试全部通过 ✓" -ForegroundColor Green
 } else {
-    Write-Host "分页测试失败 ✗" -ForegroundColor Red
+    Write-Host "有测试失败 ✗" -ForegroundColor Red
 }
 exit $code

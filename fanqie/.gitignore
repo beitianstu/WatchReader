@@ -1,0 +1,11 @@
+build/
+dist/
+test-results/jvm/
+test-results/progress-jvm/
+test-results/publicjs/
+test-results/public-reference.js
+test-results/*.ts.txt
+test-results/*.xml
+test-results/*.log
+test-results/*.png
+*.keystore

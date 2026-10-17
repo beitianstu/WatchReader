@@ -6,8 +6,12 @@ rem  普通第三方 App 无法把开关加进手表系统下拉面板（需要�
 rem  所以做成 PC 侧一键脚本 —— 双击即可，无需命令行知识。
 rem ============================================================
 
-set ADB=D:\Android\android-sdk\platform-tools\adb.exe
-set TARGET=192.168.3.213:5555
+set "ADB=%ANDROID_HOME%\platform-tools\adb.exe"
+set "TARGET=%WATCH_ADB_TARGET%"
+if not defined TARGET (
+  echo Set WATCH_ADB_TARGET before running this tool.
+  exit /b 1
+)
 set PS=powershell -NoProfile -ExecutionPolicy Bypass -File "%~dp0wifi-stay-awake.ps1" -Adb "%ADB%" -Target "%TARGET%"
 
 if not exist "%ADB%" (
@@ -31,7 +35,7 @@ echo   [2] 恢复系统默认（息屏关 Wi-Fi，省电）
 echo   [3] 只看当前状态
 echo   [0] 退出
 echo.
-set /p CH=请输入数字并回车： 
+set /p CH=请输入数字并回车：
 
 if "%CH%"=="1" ( %PS% -Policy 2 & echo. & pause & goto MENU )
 if "%CH%"=="2" ( %PS% -Policy 1 & echo. & pause & goto MENU )

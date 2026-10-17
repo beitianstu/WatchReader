@@ -8,9 +8,9 @@ import android.text.TextUtils;
 import android.view.MotionEvent;
 import android.view.View;
 
+import java.io.File;
 import java.util.ArrayList;
 import java.util.List;
-import java.util.regex.Pattern;
 
 /**
  * 阅读视图：自绘。
@@ -33,6 +33,9 @@ public class ReaderView extends View {
         void onSeekRequested();
 
         void onTocRequested();
+
+        /** Online sources may supply adjacent chapters; local TXT already contains the full book. */
+        default void onChapterBoundary(boolean forward) {}
     }
 
     private static final int BG = 0xFF0B0F14;
@@ -121,21 +124,18 @@ public class ReaderView extends View {
     private Paginator.Page current;
     /** 精确页码映射：页码 ↔ 行号，替代"按平均行数估算页码"（后者快速翻页会累积误差） */
     private PageMap pageMap;
-    private List<Chapter> chapters;
+    /** 页码缓存目录（App 私有 index 目录）；null 表示不用页码缓存 */
+    private File pageCacheDir;
+    /** 当前 PageMap 对应的版面 key（落盘页码缓存时必须与加载时一致） */
+    private String pageMapKey;
+    private List<Chapters.Chapter> chapters;
     private int estimatedPages = 1;
+    private int exactPages = -1;
+    private int pageCountGeneration;
+    private Thread pageCounter;
     private int pageIndex = 0;
     private int lastReportedOffset = -1;
     private boolean ready;
-
-    private static final class Chapter {
-        final String title;
-        final int offset;
-
-        Chapter(String title, int offset) {
-            this.title = title;
-            this.offset = offset;
-        }
-    }
 
     public ReaderView(Context context) {
         super(context);
@@ -159,7 +159,10 @@ public class ReaderView extends View {
     }
 
     public void setBook(Book book) {
+        resetPageCount();
         this.book = book;
+        this.pendingStart = -1;
+        this.pendingEnd = false;
         this.ready = false;
         this.chapters = null;
         this.pageIndex = 0;
@@ -173,13 +176,97 @@ public class ReaderView extends View {
     /** 分页参数变了（字号/字体/尺寸），页码映射必须重建 */
     private void resetPageMap() {
         pageMap = null;
+        pageMapKey = null;
+        resetPageCount();
+    }
+
+    private void resetPageCount() {
+        pageCountGeneration++;
+        if (pageCounter != null) pageCounter.interrupt();
+        pageCounter = null;
+        exactPages = -1;
+    }
+
+    /** Count with the actual layout rules off the UI thread; stale layouts cannot publish. */
+    private void countPages() {
+        if (book == null || current == null || exactPages >= 0 || pageCounter != null || !isAttachedToWindow()) return;
+        final Book snapshot = book;
+        final TextPaint paint = new TextPaint(bodyPaint);
+        final int width = (int) textWidth, height = (int) textHeight;
+        final float spacing = lineSpacingAdd;
+        final int version = pageCountGeneration, start = current.startChar, basePage = pageIndex, end = contentEnd();
+        pageCounter = new Thread(() -> {
+            android.os.Process.setThreadPriority(android.os.Process.THREAD_PRIORITY_BACKGROUND);
+            int cursor = start, count = 0;
+            while (cursor < end) {
+                if (Thread.currentThread().isInterrupted()) return;
+                Paginator.Measure measured = Paginator.measure(snapshot, paint, cursor, width, height, spacing);
+                if (measured.endChar <= cursor) return;
+                cursor = measured.endChar;
+                count++;
+            }
+            final int total = basePage + Math.max(1, count);
+            if (Thread.currentThread().isInterrupted()) return;
+            post(() -> {
+                if (version != pageCountGeneration || snapshot != book) return;
+                pageCounter = null;
+                exactPages = Math.max(pageIndex + 1, total);
+                estimatedPages = exactPages;
+                if (listener != null) listener.onPageChanged(pageIndex, exactPages);
+                invalidate();
+            });
+        }, "WatchReader-page-count");
+        pageCounter.start();
+    }
+
+    @Override protected void onDetachedFromWindow() {
+        pageCountGeneration++;
+        if (pageCounter != null) pageCounter.interrupt();
+        pageCounter = null;
+        super.onDetachedFromWindow();
+    }
+
+    @Override protected void onAttachedToWindow() {
+        super.onAttachedToWindow();
+        countPages();
     }
 
     private PageMap pageMap() {
         if (pageMap == null && book != null && textWidth > 0 && textHeight > 0) {
-            pageMap = new PageMap(book, bodyPaint, (int) textWidth, (int) textHeight, lineSpacingAdd);
+            pageMapKey = layoutKey();
+            // 复用上次落盘的页码起点（版面没变就不用重新量）；源文件已变时 load 会返回 null
+            int[] seed = PageIndexCache.load(pageCacheDir, book, pageMapKey);
+            pageMap = new PageMap(book, bodyPaint, (int) textWidth, (int) textHeight, lineSpacingAdd, seed);
         }
         return pageMap;
+    }
+
+    /**
+     * 版面 key：分页结果只取决于这些量 —— 字号 / 字体 / **实际测量字号**
+     * （bodyPaint.getTextSize() = fontSize × 系统字体缩放，系统字号变了它就会变）/
+     * 可用宽高 / 行距。任何一项变了页码全变，页码缓存必须作废。
+     */
+    private String layoutKey() {
+        return fontSize + "|" + fontFamily + "|" + bodyPaint.getTextSize()
+                + "|" + (int) textWidth + "|" + (int) textHeight + "|" + lineSpacingAdd;
+    }
+
+    /** 页码缓存目录（App 私有 index 目录）；不设置就不启用页码缓存 */
+    public void setPageCacheDir(File dir) {
+        this.pageCacheDir = dir;
+    }
+
+    /**
+     * 把本次顺序量出来的页码起点落盘，供下次打开直接复用。
+     * 在离开阅读页（onPause/onDestroy）时调用即可，不需要每翻一页都写。
+     * 盖章用的是这本 Book 的打开快照；源文件已经变了则拒绝保存（见 PageIndexCache.save）。
+     */
+    public void flushPageIndex() {
+        if (pageMap == null || pageCacheDir == null || book == null || pageMapKey == null) {
+            return;
+        }
+        int[] starts = pageMap.contiguousPageStarts();
+        PageIndexCache.save(pageCacheDir, book, pageMapKey, starts, starts.length);
     }
 
     public int getFontSize() {
@@ -228,8 +315,10 @@ public class ReaderView extends View {
     }
 
     public int getPageCount() {
-        return estimatedPages;
+        return Math.max(pageIndex + 1, exactPages >= 0 ? exactPages : estimatedPages);
     }
+
+    public boolean isPageCountExact() { return exactPages >= 0; }
 
     public int getCharCount() {
         return book == null ? 0 : book.charCount();
@@ -237,6 +326,8 @@ public class ReaderView extends View {
 
     /** 打开时恢复阅读位置（字符偏移是权威值，换字号也不会丢） */
     public void restoreTo(int charOffset) {
+        resetPageCount();
+        pendingEnd = false;
         if (book == null) {
             return;
         }
@@ -248,8 +339,30 @@ public class ReaderView extends View {
         loadPage(charOffset);
     }
 
+    /** Restore the actual final page, using the same page boundaries as ordinary flips. */
+    public void restoreToEnd() {
+        resetPageCount();
+        if (book == null) return;
+        if (getWidth() <= 0 || getHeight() <= 0) {
+            pendingEnd = true;
+            return;
+        }
+        ensureMetrics(getWidth(), getHeight());
+        PageMap map = pageMap();
+        if (map == null) return;
+        PageMap.Loc last = map.locateChar(Math.max(0, contentEnd() - 1));
+        loadPage(last.startChar, last.page);
+    }
+
+    /** A provider may leave a final newline outside its indexed paragraphs. */
+    private int contentEnd() {
+        return book.index.length == 0 ? book.charCount()
+                : Math.min(book.charCount(), book.index[book.index.length - 1][1]);
+    }
+
     /** 显式跳转（目录/百分比） */
     public void seekTo(int charOffset) {
+        resetPageCount();
         if (book == null) {
             return;
         }
@@ -258,6 +371,7 @@ public class ReaderView extends View {
     }
 
     private int pendingStart = -1;
+    private boolean pendingEnd;
 
     private void reflowFromCurrent() {
         if (book == null) {
@@ -358,13 +472,13 @@ public class ReaderView extends View {
 
         try {
             if (chapters == null) {
-                chapters = findChapters(book.text);
+                chapters = Chapters.scan(book.text);
             }
 
             Paginator.Page page = Paginator.paginateAt(book, bodyPaint, startChar,
                     (int) textWidth, (int) textHeight, lineSpacingAdd);
             current = page;
-            estimatedPages = Paginator.estimatePageCount(book, bodyPaint,
+            if (exactPages < 0) estimatedPages = Paginator.estimatePageCount(book, bodyPaint,
                     (int) textWidth, (int) textHeight, lineSpacingAdd);
 
             PageMap map = pageMap();
@@ -380,6 +494,15 @@ public class ReaderView extends View {
             } else {
                 pageIndex = 0;
             }
+
+            if (page.endChar >= contentEnd()) {
+                pageCountGeneration++;
+                if (pageCounter != null) pageCounter.interrupt();
+                pageCounter = null;
+                exactPages = pageIndex + 1;
+            }
+            estimatedPages = getPageCount();
+            countPages();
 
             ready = true;
             if (logPageDiag && pageDiag.length() < 6000) {
@@ -415,7 +538,8 @@ public class ReaderView extends View {
         PageMap map = pageMap();
         if (forward) {
             // 本页终点已经是全文末尾 = 最后一页
-            if (current.endChar >= book.charCount()) {
+            if (current.endChar >= contentEnd()) {
+                if (listener != null) listener.onChapterBoundary(true);
                 return;
             }
             // 页码 +1，起点 = 本页终点（字符精确衔接，不会漏字）
@@ -426,6 +550,7 @@ public class ReaderView extends View {
             loadPage(next.startChar, next.page);
         } else {
             if (current.startChar <= 0) {
+                if (listener != null) listener.onChapterBoundary(false);
                 return;
             }
             PageMap.Loc prev = map.prevPage(pageIndex, current.startChar);
@@ -442,7 +567,7 @@ public class ReaderView extends View {
         }
         lastReportedOffset = current.startChar;
         listener.onProgressChanged(current.startChar, getPercent());
-        listener.onPageChanged(pageIndex, estimatedPages);
+        listener.onPageChanged(pageIndex, getPageCount());
     }
 
     // ---------------- 绘制 ----------------
@@ -456,6 +581,12 @@ public class ReaderView extends View {
         }
         // 尺寸变了 → 每页容量变了 → 页码映射整体作废
         resetPageMap();
+        if (pendingEnd) {
+            pendingEnd = false;
+            pendingStart = -1;
+            restoreToEnd();
+            return;
+        }
         int anchor = pendingStart >= 0 ? pendingStart : (current == null ? 0 : current.startChar);
         pendingStart = -1;
         loadPage(anchor);
@@ -514,7 +645,7 @@ public class ReaderView extends View {
         canvas.drawText("‹", footerLeft + SIDE_INSET_PX, footerBaseline, footerPaint);
         canvas.drawText("›", getWidth() - footerLeft - footerPaint.measureText("›") - SIDE_INSET_PX,
                 footerBaseline, footerPaint);
-        String footer = (pageIndex + 1) + "/" + estimatedPages;
+        String footer = (pageIndex + 1) + "/" + (isPageCountExact() ? getPageCount() : "…");
         canvas.drawText(footer, (getWidth() - footerPaint.measureText(footer)) / 2f, footerBaseline, footerPaint);
 
         // 菜单浮层画在最上面
@@ -798,6 +929,13 @@ public class ReaderView extends View {
         menuOpen = !menuItems.isEmpty();
         menuDismissAction = onDismiss;
         crownMenuAccum = 0f;
+        // F1：菜单可能是被"长按"打开的，而那次手势的 ACTION_UP 还在路上。
+        // 它没有对应的菜单内 ACTION_DOWN，会被 handleMenuTouch 当成一次点击
+        // （按抬手位置选章 / 点页脚确认 / 点面板外关掉目录）。
+        // 这里立一个标记，让那次 UP 被丢弃；真正进入菜单的那次 DOWN 会清掉它。
+        menuSuppressUp = menuOpen;
+        menuDragging = false;
+        menuDragMoved = 0f;
         clearCrownAccum();
         if (logCrownDiag && crownTrace.length() < 24000) {
             crownTrace.append("openMenu items=").append(menuItems.size())
@@ -1068,6 +1206,8 @@ public class ReaderView extends View {
 
         switch (action) {
             case MotionEvent.ACTION_DOWN:
+                // 真正的菜单内手势开始：从现在起 ACTION_UP 才算"点击"（F1）
+                menuSuppressUp = false;
                 menuDragY = event.getY();
                 menuDragging = true;
                 menuDragMoved = 0f;
@@ -1101,6 +1241,13 @@ public class ReaderView extends View {
 
             case MotionEvent.ACTION_UP: {
                 menuDragging = false;
+                // F1：这是"打开菜单那次手势"的抬手，不是菜单内点击 —— 直接吃掉，
+                // 菜单保持打开，等用户重新点/拖/拧表冠。
+                if (menuSuppressUp) {
+                    menuSuppressUp = false;
+                    menuDragMoved = 0f;
+                    return true;
+                }
                 float x = event.getX();
                 float y = event.getY();
 
@@ -1175,6 +1322,12 @@ public class ReaderView extends View {
     private boolean menuDragging = false;
     private float menuDragY = 0f;
     private float menuDragMoved = 0f;
+    /**
+     * F1：本次菜单是被"打开菜单的那次手势"里的 ACTION_UP 触发的（长按打开）。
+     * 那个 UP 必须被丢弃 —— 否则会按抬手位置直接选中某一项。
+     * openMenu() 置 true，菜单内第一次 ACTION_DOWN 置 false。
+     */
+    private boolean menuSuppressUp = false;
 
     /**
      * 把高亮定位到指定项（打开目录时定位到"当前章节"用）。
@@ -1278,64 +1431,14 @@ public class ReaderView extends View {
     }
 
     // ---------------- 章节 ----------------
-
-    private static final Pattern[] CHAPTER_PATTERNS = new Pattern[] {
-            Pattern.compile("^第\\s*[0-9零一二三四五六七八九十百千万两]{1,12}\\s*[章节節回卷幕篇集话話]"),
-            Pattern.compile("^第\\s*[0-9]{1,6}\\s*[章节節回卷幕篇集话話]"),
-            Pattern.compile("^(Chapter|CHAPTER)\\s*[0-9IVXLC]{1,6}"),
-            Pattern.compile("^(序章|序言|楔子|前言|引子|后记|後記|尾声|尾聲|番外|正文|终章|終章)"),
-    };
-
-    private List<Chapter> findChapters(String text) {
-        List<Chapter> result = new ArrayList<>();
-        int start = 0;
-        int guard = 0;
-        while (start <= text.length() && guard++ < 200000) {
-            int end = text.indexOf('\n', start);
-            if (end < 0) {
-                end = text.length();
-            }
-            int len = end - start;
-            if (len > 0 && len <= 64) {
-                String line = text.substring(start, end).trim();
-                line = line.replace("\u3000", " ").trim();
-                if (isChapterHead(line)) {
-                    result.add(new Chapter(line, start));
-                    if (result.size() >= 3000) {
-                        break;
-                    }
-                }
-            }
-            if (end >= text.length()) {
-                break;
-            }
-            start = end + 1;
-        }
-        return result;
-    }
-
-    private static boolean isChapterCandidate(int len) {
-        return len > 0 && len <= 64;
-    }
-
-    private static boolean isChapterHead(String line) {
-        if (line.isEmpty()) {
-            return false;
-        }
-        for (Pattern p : CHAPTER_PATTERNS) {
-            if (p.matcher(line).find()) {
-                return true;
-            }
-        }
-        return false;
-    }
+    // 识别逻辑在 Chapters.java（纯逻辑，桌面可测）；这里只负责缓存与展示。
 
     private String currentChapterTitle() {
         if (chapters == null || chapters.isEmpty() || current == null) {
             return null;
         }
         String title = null;
-        for (Chapter c : chapters) {
+        for (Chapters.Chapter c : chapters) {
             if (c.offset <= current.startChar) {
                 title = c.title;
             } else {
@@ -1350,7 +1453,7 @@ public class ReaderView extends View {
         if (chapters == null) {
             return titles;
         }
-        for (Chapter c : chapters) {
+        for (Chapters.Chapter c : chapters) {
             titles.add(c.title);
         }
         return titles;
@@ -1361,7 +1464,7 @@ public class ReaderView extends View {
         if (chapters == null) {
             return offsets;
         }
-        for (Chapter c : chapters) {
+        for (Chapters.Chapter c : chapters) {
             offsets.add(c.offset);
         }
         return offsets;

@@ -22,7 +22,6 @@ function Get-WrEnv {
             $candidates = @(
                 $env:ANDROID_HOME,
                 $env:ANDROID_SDK_ROOT,
-                'D:\Android\android-sdk',
                 "$env:LOCALAPPDATA\Android\Sdk",
                 "$env:USERPROFILE\AppData\Local\Android\Sdk",
                 'C:\Android\sdk'
@@ -32,8 +31,8 @@ function Get-WrEnv {
             } | Select-Object -First 1)
         }
         'JdkHome' {
-            $candidates = @($env:JAVA_HOME, 'D:\Android\openjdk\jdk-17.0.8.101-hotspot') +
-                @(Get-ChildItem 'D:\Android\openjdk', "$env:ProgramFiles\Java", "$env:ProgramFiles\Eclipse Adoptium" `
+            $candidates = @($env:JAVA_HOME) +
+                @(Get-ChildItem "$env:ProgramFiles\Java", "$env:ProgramFiles\Eclipse Adoptium" `
                     -Directory -ErrorAction SilentlyContinue | Select-Object -ExpandProperty FullName) +
                 @(Get-ChildItem "$env:ProgramFiles\Microsoft" -Directory -Filter 'jdk*' -ErrorAction SilentlyContinue |
                     Select-Object -ExpandProperty FullName)
@@ -50,7 +49,6 @@ function Get-WrEnv {
             if ($onPath) { [void]$candidates.Add($onPath) }
             if ($env:ANDROID_HOME) { [void]$candidates.Add((Join-Path $env:ANDROID_HOME 'platform-tools\adb.exe')) }
             if ($env:ANDROID_SDK_ROOT) { [void]$candidates.Add((Join-Path $env:ANDROID_SDK_ROOT 'platform-tools\adb.exe')) }
-            [void]$candidates.Add('D:\Android\android-sdk\platform-tools\adb.exe')
             [void]$candidates.Add("$env:LOCALAPPDATA\Android\Sdk\platform-tools\adb.exe")
             [void]$candidates.Add("$env:USERPROFILE\AppData\Local\Android\Sdk\platform-tools\adb.exe")
             ($candidates | Where-Object { $_ -and (Test-Path $_) } | Select-Object -First 1)
@@ -58,7 +56,7 @@ function Get-WrEnv {
         'Target' {
             # 手表无线调试地址；可用 WATCH_ADB_TARGET 覆盖
             if ($env:WATCH_ADB_TARGET) { $env:WATCH_ADB_TARGET }
-            else { '192.168.3.213:5555' }
+            else { throw 'Specify -Target or set WATCH_ADB_TARGET to your own device serial/address.' }
         }
         'Apk' {
             Join-Path (Split-Path $PSScriptRoot -Parent) 'android\build\apk\WatchReader.apk'
@@ -74,9 +72,9 @@ function Get-WrEnv {
 function Get-WrAdbHint {
     @'
 请任选一种方式让脚本找到 adb：
-  · 设环境变量： $env:ANDROID_HOME = 'D:\Android\android-sdk'
+  · 设环境变量： $env:ANDROID_HOME = '<Android SDK>'
   · 把 platform-tools 加进 PATH
-  · 调用时显式传入： -Adb 'D:\Android\android-sdk\platform-tools\adb.exe'
+  · 调用时显式传入： -Adb '<Android SDK>\platform-tools\adb.exe'
 adb 随 Android SDK 的 platform-tools 一起分发，也可单独下载。
 '@
 }
@@ -84,7 +82,7 @@ adb 随 Android SDK 的 platform-tools 一起分发，也可单独下载。
 function Get-WrJdkHint {
     @'
 请任选一种方式让脚本找到 JDK（d8 / apksigner 需要 JDK 11 或 17）：
-  · 设环境变量： $env:JAVA_HOME = 'D:\Android\openjdk\jdk-17.0.8.101-hotspot'
+  · 设环境变量： $env:JAVA_HOME = '<JDK 17>'
   · 调用时显式传入： -JdkHome 'C:\Program Files\Java\jdk-17'
 '@
 }

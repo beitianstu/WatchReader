@@ -37,7 +37,11 @@ Write-Host "目标设备：$Target" -ForegroundColor Cyan
 
 # 自动保持"亮屏 + Wi-Fi"（幂等；不会覆盖已有会话的原始值记录）
 # 由 tools\adb-session.ps1 stop 统一还原。
-. (Join-Path $PSScriptRoot 'adb-session.ps1') -Quiet
+# F9：必须把解析出来的目标设备/adb 路径传进去 —— adb-session.ps1 的参数叫
+# $Device/$AdbPath（刻意不叫 $Target，避免点源覆盖调用方变量），不传的话
+# 会话会退回 env.ps1 的默认地址（WATCH_ADB_TARGET），
+# 换一台表或用了 -Target 就会连不上并直接抛错、安装中止。
+. (Join-Path $PSScriptRoot 'adb-session.ps1') -Quiet -Device $Target -AdbPath $Adb
 Start-KeepAliveSession
 
 function Invoke-OnDevice([string]$command) {
@@ -63,6 +67,11 @@ try {
 
     Write-Host "安装 $Apk ..." -ForegroundColor Cyan
     & $Adb -s $Target install -r $Apk 2>&1 | ForEach-Object { Write-Host "    $_" }
+    $installExitCode = $LASTEXITCODE
+    if ($installExitCode -ne 0) {
+        # 旧包仍然存在不能证明本次更新成功；失败时仍由 finally 解冻安装器。
+        throw "APK 安装失败（adb exit=$installExitCode），详见上方输出"
+    }
 
     $installed = (Invoke-OnDevice "pm list packages | grep -c com.watchreader") -join ''
     if ($installed.Trim() -eq '1') {

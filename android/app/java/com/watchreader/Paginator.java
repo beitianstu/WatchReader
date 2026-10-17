@@ -113,6 +113,10 @@ public final class Paginator {
      * 从任意字符位置开始，量出"能放进 width × height 的一段"。
      * 这是分页的唯一真相来源：返回的 endChar 就是下一页的 startChar，
      * 因此页面之间**结构上不可能漏字或重叠**。
+     *
+     * 页首若正好落在某个非空行的行尾（也就是上一页留下的换行处），这一行已经渲染完，
+     * 直接跳到下一行且**不占行**；只有真正的空行才占一个视觉行。
+     * 该规则与 {@link #paginateAt} 完全一致，否则一页会白占一行、页首出现空行。
      */
     public static Measure measure(Book book, TextPaint paint, int startChar,
                                   int width, int height, float lineSpacingAdd) {
@@ -132,6 +136,7 @@ public final class Paginator {
         int cursor = from;
         int rows = 0;
         int guard = 0;
+        boolean lastRowEmpty = false;
 
         while (rows < maxRows && line < book.index.length && guard++ < maxRows * 4 + 64) {
             int[] range = book.index[line];
@@ -141,9 +146,18 @@ public final class Paginator {
             // 起点可能落在本行中间（上一页把这一行切开了）
             int offset = Math.max(cursor, lineStart);
             if (offset >= lineEnd) {
-                // 空行：占一行
+                if (lineStart < lineEnd) {
+                    // 游标停在"非空行的行尾"：本页起点恰好是上一行的换行处，
+                    // 这一行已经渲染过，直接跳到下一行 —— 不占行、不产生空行。
+                    // （旧行为会把它当成空行占掉一行，并在 paginateAt 里把本页起点
+                    //   记成上一行的行首，见 F3。）
+                    line++;
+                    continue;
+                }
+                // 真正的空行：占一行（与 paginateAt 同一规则）
                 cursor = lineEnd;
                 rows++;
+                lastRowEmpty = true;
                 line++;
                 continue;
             }
@@ -165,6 +179,7 @@ public final class Paginator {
                 produced++;
                 offset = end;
             }
+            lastRowEmpty = false;
 
             if (produced == 0 && rows < maxRows) {
                 // 兜底：本行一个字符都放不下也不能死循环
@@ -172,6 +187,14 @@ public final class Paginator {
                 rows++;
             }
             line++;
+        }
+
+        // 若本页最后一行是真空行：把终点推进到下一行行首。
+        // 空行的字符区间是零长度（[p,p)），如果不推进，下一页的 lineWithChar(p)
+        // 又会落回同一个空行、再渲染一条空行 —— 同一空行被渲染两次、还白占一行。
+        // 推进后"下一页起点 = 本页终点"依然成立，且该页首能被恢复路径完全复现（F3）。
+        if (lastRowEmpty && cursor < charCount) {
+            cursor++;
         }
 
         return new Measure(from, cursor, rows);
@@ -215,6 +238,10 @@ public final class Paginator {
      * 这是分页的主入口：页面以**字符区间**为界，[startChar, endChar)。
      * 下一页直接用上一页的 endChar 当 startChar，因此长段落被切开时
      * 剩下的部分一定会在下一页渲染，不会丢（这是"段落超一行后内容被截断"的根治点）。
+     *
+     * 返回的 {@code startChar} 是**本页第一行的真实起点**：当请求位置正好是换行处
+     * （上一页的行尾）时会前移到下一行行首；{@code endChar} 与 {@link #measure} 的
+     * endChar 严格相同，保证翻页衔接与 measure 一致（这两点都是 F3 的修复要求）。
      */
     public static Page paginateAt(Book book, TextPaint paint, int startChar,
                                   int width, int height, float lineSpacingAdd) {
@@ -246,8 +273,14 @@ public final class Paginator {
 
             int offset = Math.max(cursor, lineStart);
             if (offset >= lineEnd) {
-                // 空行
-                starts[row] = lineStart;
+                if (lineStart < lineEnd) {
+                    // 与 measure 同一规则：已渲染完的非空行不占行、不记起点，
+                    // 直接跳到下一行，于是本页首行起点不会回退到上一行（F3）。
+                    line++;
+                    continue;
+                }
+                // 真正的空行：占一行，起点就是本行位置（offset == lineStart）
+                starts[row] = offset;
                 texts[row] = "";
                 row++;
                 cursor = Math.max(cursor, lineStart);

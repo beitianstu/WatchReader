@@ -109,9 +109,10 @@ function Start-KeepAliveSession {
     }
 
     Session-OnDevice "settings put system screen_off_timeout $($script:SessionTimeoutMs)" | Out-Null
+    # F10：不再调用 `svc power stayon true/false` —— 项目实测它会重置
+    # STAY_ON_WHILE_PLUGGED_IN。保持"插电常亮"只靠下面这条 global 设置（PowerManager 直接读它）。
     Session-OnDevice 'settings put global stay_on_while_plugged_in 7' | Out-Null   # 1=AC 2=USB 4=无线
     Session-OnDevice 'settings put global wifi_sleep_policy 2' | Out-Null           # 2=永不休眠
-    Session-OnDevice 'svc power stayon true' | Out-Null
     Session-OnDevice 'input keyevent KEYCODE_WAKEUP' | Out-Null
 
     Session-Say "已开启保持：" 'Green'
@@ -131,6 +132,10 @@ function Stop-KeepAliveSession {
     $stayOn = if ("$($origin.stayOnPlugged)" -match '^\d+$') { [int]$origin.stayOnPlugged } else { 0 }
     $wifi = if ("$($origin.wifiSleepPolicy)" -match '^\d+$') { [int]$origin.wifiSleepPolicy } else { 1 }
 
+    # F10：`svc power stayon false` 必须在写回原值**之前**执行 ——
+    # 项目实测该命令会把 stay_on_while_plugged_in 清成 0，旧顺序（先写回、后 stayon false）
+    # 等于自己把刚还原的值又冲掉。
+    Session-OnDevice 'svc power stayon false' | Out-Null
     Session-OnDevice "settings put system screen_off_timeout $timeout" | Out-Null
     Session-OnDevice "settings put global stay_on_while_plugged_in $stayOn" | Out-Null
 
@@ -141,10 +146,19 @@ function Stop-KeepAliveSession {
     } else {
         Session-Say ("  Wi-Fi 休眠保持为 2（未还原；需要还原请加 -RestoreWifiPolicy）") 'DarkGray'
     }
-    Session-OnDevice 'svc power stayon false' | Out-Null
+
+    # 读回设备实际值，别只信自己的打印（项目方法论）
+    $readTimeout = Session-OnDevice 'settings get system screen_off_timeout'
+    $readStayOn = Session-OnDevice 'settings get global stay_on_while_plugged_in'
+    $readWifi = Session-OnDevice 'settings get global wifi_sleep_policy'
 
     Session-Say "已还原：" 'Green'
     Session-Say ("  息屏超时={0} ms  插电常亮={1}  Wi-Fi休眠={2}" -f $timeout, $stayOn, $wifi)
+    Session-Say ("  设备读回：息屏超时={0}  插电常亮={1}  Wi-Fi休眠={2}" -f `
+        $readTimeout, $readStayOn, $readWifi) 'DarkGray'
+    if ("$readStayOn" -ne "$stayOn") {
+        Session-Say ("  ⚠ 插电常亮未按原值还原（期望 {0}，实际 {1}）" -f $stayOn, $readStayOn) 'Yellow'
+    }
     if ($origin.capturedAt) { Session-Say ("  （原始状态记录于 {0}）" -f $origin.capturedAt) 'DarkGray' }
 
     Remove-Item $script:sessionStateFile -Force -ErrorAction SilentlyContinue

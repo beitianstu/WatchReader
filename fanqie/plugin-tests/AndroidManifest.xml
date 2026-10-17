@@ -1,0 +1,5 @@
+<manifest xmlns:android="http://schemas.android.com/apk/res/android" package="com.watchreader.plugin.tests">
+    <uses-sdk android:minSdkVersion="29" android:targetSdkVersion="29" />
+    <application android:label="Plugin concurrency checks" />
+    <instrumentation android:name="com.watchreader.fanqie.NativeParallelInstrumentation" android:targetPackage="com.watchreader.fanqie" />
+</manifest>

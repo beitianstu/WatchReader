@@ -2,8 +2,6 @@ package com.watchreader;
 
 import android.app.Activity;
 import android.app.AlertDialog;
-import android.content.Context;
-import android.content.IntentFilter;
 import android.content.SharedPreferences;
 import android.graphics.Color;
 import android.os.Bundle;
@@ -49,45 +47,24 @@ public class ReaderActivity extends Activity implements ReaderView.Listener {
     private int lastFontSize;
     private StringBuilder crownLog;
     private int crownRawEvents;
-
     /**
-     * 调试用广播：adb 可以直接触发"息屏保持 Wi-Fi"开关，绕开菜单点击坐标，
-     * 便于确定性验证锁是否真的生效。
-     *   adb shell am broadcast -a com.watchreader.SET_KEEPWIFI --ez on true
+     * F4：只有真正装载过一页（restoreTo/seekTo 成功走完 loadPage → onProgressChanged）
+     * 之后才允许落盘。否则"加载中/加载失败时 onPause/onDestroy"会把初始值 0 写进
+     * progress.<id>.offset，把用户原有进度直接冲掉。
      */
-    public static final String ACTION_SET_KEEPWIFI = "com.watchreader.SET_KEEPWIFI";
-
-    private final android.content.BroadcastReceiver keepWifiReceiver =
-            new android.content.BroadcastReceiver() {
-                @Override
-                public void onReceive(android.content.Context context, android.content.Intent intent) {
-                    if (!ACTION_SET_KEEPWIFI.equals(intent.getAction())) {
-                        return;
-                    }
-                    boolean on = intent.getBooleanExtra("on", !KeepAwake.isEnabled(context));
-                    KeepAwake.setEnabled(context, on);
-                    KeepAwake.sync(context);
-                    Toast.makeText(context, on ? "keepWifi ON" : "keepWifi OFF", Toast.LENGTH_SHORT).show();
-                    android.util.Log.e(LOG_TAG, "WR keepWifi=" + (on ? 1 : 0)
-                            + " held=" + (KeepAwake.isHeld() ? 1 : 0));
-                }
-            };
-
-    /** 广播只做调试通道，用明显的前缀便于 logcat 过滤（中文日志在华为手表上会被丢弃） */
-    public static final String TAG_WR = "ActivityManager";
+    private boolean progressLoaded;
+    /**
+     * F4：onDestroy 之后，后台建索引线程可能才把 runOnUiThread 回调排到队列里；
+     * 那个回调若继续 setBook/restoreTo，就会替一本已经关掉的书写进度，
+     * 有可能覆盖新会话刚写的值。destroyed 之后一切后台回调都变成空操作。
+     */
+    private boolean destroyed;
 
     @Override
     protected void onCreate(Bundle savedInstanceState) {
         super.onCreate(savedInstanceState);
         prefs = getSharedPreferences(PREFS, MODE_PRIVATE);
 
-        // 只接收我们自己发的、且需要显式带包名的广播，避免被外部随意触发
-        IntentFilter keepWifiFilter = new IntentFilter(ACTION_SET_KEEPWIFI);
-        if (android.os.Build.VERSION.SDK_INT >= 33) {
-            registerReceiver(keepWifiReceiver, keepWifiFilter, Context.RECEIVER_NOT_EXPORTED);
-        } else {
-            registerReceiver(keepWifiReceiver, keepWifiFilter);
-        }
         if (CROWN_DIAG) {
             crownLog = new StringBuilder();
         }
@@ -117,11 +94,6 @@ public class ReaderActivity extends Activity implements ReaderView.Listener {
         // 阅读时保持亮屏：正拧表冠时熄屏会很别扭
         getWindow().addFlags(android.view.WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON);
         readerView.requestFocus();
-
-        // 若用户开了"息屏保持 Wi-Fi"，这里就把锁拿起来。
-        // 注意：**不在 onPause 释放** —— 否则一回到表盘就失效，这个开关就没意义了；
-        // 只在用户手动关掉开关时释放（进程被杀时系统会自动回收）。
-        KeepAwake.sync(this);
 
         loadBookAsync();
     }
@@ -223,48 +195,116 @@ public class ReaderActivity extends Activity implements ReaderView.Listener {
         super.onPause();
         saveProgress();
         writeCrownLog();
+        flushPageIndex();
     }
 
     @Override
     protected void onDestroy() {
-        super.onDestroy();
-        saveProgress();
+        saveProgress();      // 已装载过才写（见 progressLoaded），正常每页落盘不受影响
         writeCrownLog();
-        try {
-            unregisterReceiver(keepWifiReceiver);
-        } catch (Throwable ignored) {
+        flushPageIndex();    // 把本次量出的页码起点落盘，下次打开不用重量
+        destroyed = true;    // 之后的后台回调一律不生效，避免替新会话写进度
+        super.onDestroy();
+    }
+
+    /** 落盘页码缓存；失败只是下次多量一遍，不影响阅读 */
+    private void flushPageIndex() {
+        if (readerView == null) {
+            return;
         }
+        try {
+            readerView.flushPageIndex();
+        } catch (Throwable t) {
+            android.util.Log.e(LOG_TAG, "WatchReader flush page index failed: " + t);
+        }
+    }
+
+    /** 单调时钟的毫秒差（System.nanoTime 不受系统时间调整影响，只用于诊断） */
+    private static long elapsedMs(long startNanos) {
+        return (System.nanoTime() - startNanos) / 1_000_000L;
     }
 
     // ---------------- 打开 ----------------
 
+    /** 书库/阅读页共用的私有缓存目录（索引缓存 + 页码缓存） */
+    private File indexDir() {
+        File dir = new File(getFilesDir(), "index");
+        if (!dir.isDirectory() && !dir.mkdirs()) {
+            throw new IllegalStateException("无法创建索引目录");
+        }
+        return dir;
+    }
+
     private void loadBookAsync() {
         final TextView loading = new TextView(this);
-        loading.setText("正在建立索引…");
+        // 真实阶段由 Book 回调刷新：只有真的要重建索引才说"正在建立索引"
+        // （"重建"不只是首次打开：源文件更新、缓存坏了同样会重建，所以不写"首次"）
+        loading.setText("正在打开…");
         loading.setTextColor(0xFF8394AB);
         loading.setTextSize(12f);
         loading.setGravity(Gravity.CENTER);
         addContentView(loading, new FrameLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT,
                 ViewGroup.LayoutParams.MATCH_PARENT));
 
+        // 单调时钟：从点击打开算起，到首屏就绪为止（诊断用，不改变任何行为）
+        final long openStartNanos = System.nanoTime();
+
         new Thread(() -> {
             try {
-                File indexDir = new File(getFilesDir(), "index");
-                if (!indexDir.isDirectory() && !indexDir.mkdirs()) {
-                    throw new IllegalStateException("无法创建索引目录");
-                }
-                final Book book = Book.open(bookFile, indexDir);
-                // 立刻记一笔"打开成功"，方便 adb 侧取证（也能验证索引耗时）
+                final File cacheDir = indexDir();
+                // 本次装载是否真的重建了索引（缓存命中/内存复用都不算）
+                final boolean[] rebuilt = { false };
+                final Book.LoadListener phase = p -> {
+                    if (p == Book.LoadPhase.BUILD_INDEX) {
+                        rebuilt[0] = true;
+                    }
+                    runOnUiThread(() -> {
+                        if (!destroyed) {
+                            loading.setText(p == Book.LoadPhase.BUILD_INDEX
+                                    ? "正在建立索引…"
+                                    : "正在加载…");
+                        }
+                    });
+                };
+                final long bookStartNanos = System.nanoTime();
+                final Book book = BookCache.open(bookFile, cacheDir, phase);
+                final long bookLoadMs = elapsedMs(bookStartNanos);
+                // lastOpen：第 4 段是**本次**索引耗时（复用就是 0），不再是"第一次构建的耗时"
                 prefs.edit().putString("lastOpen", book.title + "|" + book.charCount()
-                        + "|" + TextDecoder.describe(book.encoding) + "|" + book.buildMs).commit();
+                        + "|" + TextDecoder.describe(book.encoding) + "|"
+                        + (rebuilt[0] ? book.buildMs : 0L)).commit();
                 runOnUiThread(() -> {
+                    if (destroyed) {
+                        // 页面已经销毁：不要 setBook/restoreTo，更不要替它落盘（F4）
+                        return;
+                    }
                     loading.setVisibility(android.view.View.GONE);
+                    readerView.setPageCacheDir(cacheDir);
                     readerView.setBook(book);
                     int offset = prefs.getInt(progressOffsetKey(), 0);
+                    // 即使 saveProgress 在 restoreTo 之前被调用（例如恰好 onPause），
+                    // 写回的也是原值而不是 0
+                    lastOffset = offset;
+                    long restoreStartNanos = System.nanoTime();
                     readerView.restoreTo(offset);
+                    long restoreMs = elapsedMs(restoreStartNanos);
+                    long totalMs = elapsedMs(openStartNanos);
+                    // 诊断日志（无书名/正文/路径）：本次 Book 加载、恢复定位、到首屏就绪的总耗时、索引阶段
+                    android.util.Log.i(LOG_TAG, "WR load book=" + bookLoadMs + "ms restore=" + restoreMs
+                            + "ms total=" + totalMs + "ms stage="
+                            + (rebuilt[0] ? ("build" + book.buildMs + "ms") : "reuse"));
+                    final long firstFrameStart = openStartNanos;
+                    readerView.postOnAnimation(() -> {
+                        if (!destroyed) {
+                            android.util.Log.i(LOG_TAG, "WR first-frame total=" + elapsedMs(firstFrameStart) + "ms");
+                        }
+                    });
+                    String indexInfo = rebuilt[0]
+                            ? ("索引 " + book.buildMs + "ms")
+                            : "已复用索引";
                     String msg = String.format(java.util.Locale.US,
-                            "%s · %s · %d 字 · 索引 %dms", book.title,
-                            TextDecoder.describe(book.encoding), book.charCount(), book.buildMs);
+                            "%s · %s · %d 字 · %s", book.title,
+                            TextDecoder.describe(book.encoding), book.charCount(), indexInfo);
                     Toast.makeText(this, msg, Toast.LENGTH_LONG).show();
                 });
             } catch (final Throwable e) {
@@ -272,6 +312,9 @@ public class ReaderActivity extends Activity implements ReaderView.Listener {
                 android.util.Log.e("ActivityManager", "WatchReader open failed: " + e, e);
                 prefs.edit().putString("lastError", String.valueOf(e)).commit();
                 runOnUiThread(() -> {
+                    if (destroyed) {
+                        return;
+                    }
                     Toast.makeText(this, "打开失败：" + e.getMessage(), Toast.LENGTH_LONG).show();
                     finish();
                 });
@@ -293,6 +336,11 @@ public class ReaderActivity extends Activity implements ReaderView.Listener {
         if (bookFile == null || readerView == null) {
             return;
         }
+        // F4：还没成功装载过任何一页时（正在建索引 / 打开失败 / 只走到 onPause），
+        // lastOffset 仍是初始值 0，此时落盘等于把旧进度冲成 0。宁可不写。
+        if (!progressLoaded) {
+            return;
+        }
         // 用 commit() 而不是 apply()：apply 是**异步**落盘，手表随时可能被系统杀掉，
         // 那次写就可能还没写到磁盘就丢了（用户反馈"有时无法保存进度"）。
         // 每页多花几毫秒换"一定落盘"，这个交易在手表上值得。
@@ -309,8 +357,12 @@ public class ReaderActivity extends Activity implements ReaderView.Listener {
 
     @Override
     public void onProgressChanged(int charOffset, float percent) {
+        if (destroyed) {
+            return;
+        }
         lastOffset = charOffset;
         lastPercent = percent;
+        progressLoaded = true;   // 从现在起才允许落盘（F4）
         // 每翻一页就落盘：手表可能随时被系统杀掉，不能等 onPause
         saveProgress();
     }
@@ -353,11 +405,6 @@ public class ReaderActivity extends Activity implements ReaderView.Listener {
         items.add(new ReaderView.MenuItem("切换字体（黑体/等宽/衬线）", this::cycleFontFamily));
         items.add(new ReaderView.MenuItem("目录", this::showTocMenu));
         items.add(new ReaderView.MenuItem("按百分比跳转", this::showSeekDialog));
-        // 息屏保持 Wi-Fi 开关（普通 APK 改不了系统策略，改用 WifiLock + CPU 锁实现）
-        boolean keepWifi = KeepAwake.isEnabled(this);
-        items.add(new ReaderView.MenuItem(
-                "息屏保持 Wi-Fi：" + (keepWifi ? "开" : "关"),
-                () -> toggleKeepWifi()));
         if (CROWN_DIAG) {
             items.add(new ReaderView.MenuItem("查看表冠诊断", this::showCrownDiag));
             items.add(new ReaderView.MenuItem("查看页码诊断", this::showPageDiag));
@@ -453,19 +500,6 @@ public class ReaderActivity extends Activity implements ReaderView.Listener {
             return;
         }
         super.onBackPressed();
-    }
-    /** 切换"息屏保持 Wi-Fi"，并立刻把锁同步到新状态 */
-    private void toggleKeepWifi() {
-        android.util.Log.e(LOG_TAG, "WatchReader toggleKeepWifi 被调用，当前=" + KeepAwake.isEnabled(this));
-        boolean next = !KeepAwake.isEnabled(this);
-        KeepAwake.setEnabled(this, next);
-        KeepAwake.sync(this);
-        android.util.Log.e(LOG_TAG, "WatchReader toggleKeepWifi 结果：keepWifi=" + next
-                + " 锁持有=" + KeepAwake.isHeld());
-        String msg = next
-                ? "已开启：息屏后 Wi-Fi 保持（会更费电）"
-                : "已关闭：恢复系统休眠策略";
-        Toast.makeText(this, msg, Toast.LENGTH_LONG).show();
     }
 
     private void applyFont(int size) {
