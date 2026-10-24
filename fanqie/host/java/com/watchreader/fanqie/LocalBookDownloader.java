@@ -51,6 +51,6 @@ public final class LocalBookDownloader {
         }finally{for(Future<ChapterContent> task:pending.values())task.cancel(true);FETCHERS.purge();}
         if(cancelled.getAsBoolean())return null;
         String name=book.title.replaceAll("[\\\\/:*?\"<>|\\p{Cntrl}]","_").trim();if(name.isEmpty())name="番茄小说";if(name.length()>60)name=name.substring(0,60);
-        File result=new File(books,name+"_"+book.id+".txt");Files.move(part.toPath(),result.toPath(),StandardCopyOption.REPLACE_EXISTING,StandardCopyOption.ATOMIC_MOVE);state.delete();return result;
+        File result=new File(books,name+"_"+book.id+".txt");Files.move(part.toPath(),result.toPath(),StandardCopyOption.REPLACE_EXISTING,StandardCopyOption.ATOMIC_MOVE);DownloadedNovel.save(result,scope,book,chapters);state.delete();return result;
     }
 }

@@ -1,0 +1,74 @@
+<?xml version="1.0" encoding="utf-8"?>
+<manifest xmlns:android="http://schemas.android.com/apk/res/android">
+
+    <uses-sdk
+        android:minSdkVersion="29"
+        android:targetSdkVersion="29" />
+
+    <uses-feature
+        android:name="android.hardware.type.watch"
+        android:required="false" />
+
+    <!-- Android 10/11 旧存储模型：扫描 Download 等公共目录；拒绝时仍可读 App 私有书库 -->
+    <uses-permission android:name="android.permission.READ_EXTERNAL_STORAGE" />
+    <uses-permission android:name="android.permission.INTERNET" />
+
+    <application
+        android:allowBackup="false"
+        android:enableOnBackInvokedCallback="true"
+        android:label="WatchReader 手机版"
+        android:requestLegacyExternalStorage="true"
+        android:supportsRtl="false"
+        android:theme="@android:style/Theme.Material.Light.NoActionBar"
+        android:usesCleartextTraffic="false">
+
+        <!-- 显式手机排版开关：旧 ReaderView 默认仍是圆屏公式，只有这里为 true 才走矩形分支 -->
+        <meta-data
+            android:name="com.watchreader.PHONE_UI"
+            android:value="true" />
+
+        <activity
+            android:name="com.watchreader.phone.PhoneMainActivity"
+            android:configChanges="orientation|screenSize|keyboardHidden|uiMode"
+            android:exported="true"
+            android:label="WatchReader 手机版"
+            android:windowSoftInputMode="adjustResize">
+            <intent-filter>
+                <action android:name="android.intent.action.MAIN" />
+                <category android:name="android.intent.category.LAUNCHER" />
+            </intent-filter>
+        </activity>
+
+        <!-- 官方番茄缓存导入：只读 root 私有缓存，入口 Intent 由主程序添加 -->
+        <activity
+            android:name=".OfficialCacheActivity"
+            android:configChanges="orientation|screenSize|keyboardHidden|uiMode"
+            android:exported="false" />
+
+        <!-- 手机阅读页：ReaderView 排版内核 + Mochi 顶栏/底栏/设置页 -->
+        <activity
+            android:name=".PhoneReaderActivity"
+            android:configChanges="orientation|screenSize|keyboardHidden|uiMode"
+            android:exported="false"
+            android:windowSoftInputMode="adjustResize" />
+
+        <!-- 手机番茄界面：书架/搜索/详情/目录/阅读/段评/封面/下载/账号 -->
+        <activity
+            android:name=".PhoneFanqieActivity"
+            android:configChanges="orientation|screenSize|keyboardHidden|uiMode"
+            android:exported="false"
+            android:windowSoftInputMode="adjustResize" />
+
+        <!-- 旧阅读页保留给旧入口/来源跳转；手机书库已改走 PhoneReaderActivity -->
+        <activity
+            android:name="com.watchreader.ReaderActivity"
+            android:configChanges="orientation|screenSize|keyboardHidden|uiMode"
+            android:exported="false" />
+
+        <activity
+            android:name="com.watchreader.fanqie.FanqieActivity"
+            android:configChanges="orientation|screenSize|keyboardHidden|uiMode"
+            android:exported="false"
+            android:windowSoftInputMode="adjustResize" />
+    </application>
+</manifest>

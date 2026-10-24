@@ -15,7 +15,7 @@ import java.io.IOException;
  * 命中条件 = 绝对路径 + fileSize + lastModified 全一致，所以书被改过/换过一定不会复用。
  * 线程安全：整个 open 串行化，进程里同时只可能有一本书在装载。
  */
-final class BookCache {
+public final class BookCache {
 
     private static String key;
     private static Book book;
@@ -23,7 +23,7 @@ final class BookCache {
     private BookCache() {
     }
 
-    static synchronized Book open(File file, File cacheDir, Book.LoadListener listener) throws IOException {
+    public static synchronized Book open(File file, File cacheDir, Book.LoadListener listener) throws IOException {
         String k = keyOf(file);
         if (book != null && k.equals(key)) {
             // 内存里就是这本书：连缓存文件都不用读

@@ -37,14 +37,22 @@ public final class Paginator {
         public final int[] lineStarts;
         /** 每行文本 */
         public final String[] lineTexts;
+        /** 页首预留的行数（手机章节标题区）；0 = 普通页 */
+        public final int topRows;
 
         Page(int startLine, int endLine, int startChar, int endChar, int[] lineStarts, String[] lineTexts) {
+            this(startLine, endLine, startChar, endChar, lineStarts, lineTexts, 0);
+        }
+
+        Page(int startLine, int endLine, int startChar, int endChar, int[] lineStarts, String[] lineTexts,
+             int topRows) {
             this.startLine = startLine;
             this.endLine = endLine;
             this.startChar = startChar;
             this.endChar = endChar;
             this.lineStarts = lineStarts;
             this.lineTexts = lineTexts;
+            this.topRows = topRows;
         }
 
         public int lineCount() {
@@ -81,11 +89,18 @@ public final class Paginator {
         public final int startChar;
         public final int endChar;
         public final int rowCount;
+        /** 页首预留的行数（手机章节标题区）；0 = 普通页 */
+        public final int topRows;
 
         Measure(int startChar, int endChar, int rowCount) {
+            this(startChar, endChar, rowCount, 0);
+        }
+
+        Measure(int startChar, int endChar, int rowCount, int topRows) {
             this.startChar = startChar;
             this.endChar = endChar;
             this.rowCount = rowCount;
+            this.topRows = topRows;
         }
     }
 
@@ -120,8 +135,18 @@ public final class Paginator {
      */
     public static Measure measure(Book book, TextPaint paint, int startChar,
                                   int width, int height, float lineSpacingAdd) {
+        return measure(book, paint, startChar, width, height, lineSpacingAdd, null);
+    }
+
+    /**
+     * 带章节装饰的测量（手机）。decor 为 null 时与旧行为逐字节一致：
+     * 不预留行、不跳过标题行、不在章首断页。三件事都由 decor 决定，
+     * 所以 ReaderView 绘制、PageMap 定位、页数统计只要传同一个 decor 就不会算出不同的页。
+     */
+    public static Measure measure(Book book, TextPaint paint, int startChar,
+                                  int width, int height, float lineSpacingAdd, ChapterDecor decor) {
         if (book == null || book.index.length == 0 || width <= 0 || height <= 0) {
-            return new Measure(startChar, startChar, 0);
+            return new Measure(startChar, startChar, 0, 0);
         }
         int charCount = book.charCount();
         int from = Math.max(0, Math.min(startChar, Math.max(0, charCount - 1)));
@@ -132,16 +157,43 @@ public final class Paginator {
         }
         int maxRows = Math.max(1, (int) Math.floor(height / lineHeight));
 
-        int line = lineWithChar(book, from);
-        int cursor = from;
+        // 章首页：顶部留给放大的标题 + 分隔线，正文从标题行之后开始
+        int reserved = 0;
+        int bodyStart = from;
+        if (decor != null) {
+            reserved = Math.min(decor.topRowsAt(from), Math.max(0, maxRows - 1));
+        }
+        if (reserved > 0) {
+            bodyStart = decor.bodyStart(book.text, from);
+            if (bodyStart > charCount) {
+                bodyStart = charCount;
+            }
+        }
+        int bodyRows = Math.max(1, maxRows - reserved);
+
+        if (bodyStart >= charCount) {
+            // 标题就是全文最后一行：这一页只有标题区，终点至少前进一个字符
+            int end = Math.min(charCount, Math.max(from + 1, bodyStart));
+            return new Measure(from, end, 0, reserved);
+        }
+
+        int line = lineWithChar(book, bodyStart);
+        int cursor = bodyStart;
         int rows = 0;
         int guard = 0;
         boolean lastRowEmpty = false;
 
-        while (rows < maxRows && line < book.index.length && guard++ < maxRows * 4 + 64) {
+        while (rows < bodyRows && line < book.index.length && guard++ < bodyRows * 4 + 64) {
             int[] range = book.index[line];
             int lineStart = range[0];
             int lineEnd = range[1];
+
+            // 章节之间强制换页：正文不越过下一个章首（本页自己的章首由 bodyStart 跳过）
+            if (decor != null && rows > 0 && lineStart >= bodyStart && decor.isStart(lineStart)) {
+                cursor = lineStart;
+                lastRowEmpty = false;
+                break;
+            }
 
             // 起点可能落在本行中间（上一页把这一行切开了）
             int offset = Math.max(cursor, lineStart);
@@ -164,7 +216,7 @@ public final class Paginator {
 
             String source = book.text;
             int produced = 0;
-            while (offset < lineEnd && rows < maxRows) {
+            while (offset < lineEnd && rows < bodyRows) {
                 int fit = fitChars(paint, source, offset, lineEnd, width);
                 if (fit <= 0) {
                     fit = 1;
@@ -181,7 +233,7 @@ public final class Paginator {
             }
             lastRowEmpty = false;
 
-            if (produced == 0 && rows < maxRows) {
+            if (produced == 0 && rows < bodyRows) {
                 // 兜底：本行一个字符都放不下也不能死循环
                 cursor = lineEnd;
                 rows++;
@@ -197,7 +249,7 @@ public final class Paginator {
             cursor++;
         }
 
-        return new Measure(from, cursor, rows);
+        return new Measure(from, cursor, rows, reserved);
     }
 
 
@@ -245,13 +297,27 @@ public final class Paginator {
      */
     public static Page paginateAt(Book book, TextPaint paint, int startChar,
                                   int width, int height, float lineSpacingAdd) {
+        return paginateAt(book, paint, startChar, width, height, lineSpacingAdd, null);
+    }
+
+    /** 带章节装饰的取页；与 {@link #measure(Book, TextPaint, int, int, int, float, ChapterDecor)} 同一套边界。 */
+    public static Page paginateAt(Book book, TextPaint paint, int startChar,
+                                  int width, int height, float lineSpacingAdd, ChapterDecor decor) {
         if (book == null || book.index.length == 0 || width <= 0 || height <= 0) {
             return EMPTY;
         }
 
-        Measure m = measure(book, paint, startChar, width, height, lineSpacingAdd);
+        Measure m = measure(book, paint, startChar, width, height, lineSpacingAdd, decor);
         if (m.endChar <= m.startChar) {
             return EMPTY;
+        }
+
+        int bodyStart = m.startChar;
+        if (m.topRows > 0) {
+            bodyStart = decor.bodyStart(book.text, m.startChar);
+            if (bodyStart > book.charCount()) {
+                bodyStart = book.charCount();
+            }
         }
 
         int count = Math.max(1, m.rowCount);
@@ -259,17 +325,21 @@ public final class Paginator {
         String[] texts = new String[count];
 
         // 按视觉行逐行切出文本（与 measure 用同一套 fitChars，保证边界一致）
-        int line = lineWithChar(book, m.startChar);
-        int cursor = m.startChar;
+        int line = lineWithChar(book, bodyStart);
+        int cursor = bodyStart;
         int row = 0;
         int guard = 0;
-        int lastEnd = m.startChar;
+        int lastEnd = bodyStart;
 
         while (row < count && cursor < m.endChar && line < book.index.length
                 && guard++ < count * 4 + 64) {
             int[] range = book.index[line];
             int lineStart = range[0];
             int lineEnd = Math.min(range[1], m.endChar);
+
+            if (decor != null && row > 0 && lineStart >= bodyStart && decor.isStart(lineStart)) {
+                break;
+            }
 
             int offset = Math.max(cursor, lineStart);
             if (offset >= lineEnd) {
@@ -307,6 +377,11 @@ public final class Paginator {
         }
 
         if (row == 0) {
+            // 章首页只有标题区（标题就是全文最后一行）：仍然算一页，否则这一页永远打不开
+            if (m.topRows > 0 && m.endChar > m.startChar) {
+                return new Page(m.startChar, m.endChar, m.startChar, m.endChar,
+                        new int[0], new String[0], m.topRows);
+            }
             return EMPTY;
         }
 
@@ -315,12 +390,13 @@ public final class Paginator {
         System.arraycopy(starts, 0, finalStarts, 0, row);
         System.arraycopy(texts, 0, finalTexts, 0, row);
 
-        int pageStart = finalStarts[0];
+        // 章首页的页身份是章首本身（标题区属于这一页），普通页仍用首行起点
+        int pageStart = m.topRows > 0 ? m.startChar : finalStarts[0];
         // 结束位置以 measure 为准（它决定了下一页从哪里开始），文本可能因避头尾回退而略短，
         // 回退掉的那些字会在下一页开头出现，不会丢。
         int pageEnd = Math.max(m.endChar, lastEnd);
 
-        return new Page(pageStart, pageEnd, pageStart, pageEnd, finalStarts, finalTexts);
+        return new Page(pageStart, pageEnd, pageStart, pageEnd, finalStarts, finalTexts, m.topRows);
     }
 
     /** 当前字号下的行高（含行间距） */
@@ -367,6 +443,12 @@ public final class Paginator {
      * 这个值只用于底栏显示"第几页/共几页"，不参与任何定位计算。
      */
     public static int estimatePageCount(Book book, TextPaint paint, int width, int height, float lineSpacingAdd) {
+        return estimatePageCount(book, paint, width, height, lineSpacingAdd, null);
+    }
+
+    /** 同上；decor 非空时抽样也按章节规则量，估算值才不会比真实页数明显偏小。 */
+    public static int estimatePageCount(Book book, TextPaint paint, int width, int height,
+                                        float lineSpacingAdd, ChapterDecor decor) {
         if (book == null || book.index.length == 0) {
             return 1;
         }
@@ -381,7 +463,7 @@ public final class Paginator {
         int cursor = 0;
         int step = Math.max(1, total / samples);
         for (int i = 0; i < samples && cursor < total; i++) {
-            Measure m = measure(book, paint, cursor, width, height, lineSpacingAdd);
+            Measure m = measure(book, paint, cursor, width, height, lineSpacingAdd, decor);
             int span = m.endChar - m.startChar;
             if (span <= 0) {
                 break;

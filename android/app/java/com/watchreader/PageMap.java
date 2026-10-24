@@ -32,6 +32,8 @@ final class PageMap {
     private final int height;
     private final float spacingAdd;
     private final int charCount;
+    /** 手机章节装饰；null = 旧排版（手表） */
+    private final ChapterDecor decor;
 
     /** 页码 → 起始字符偏移 */
     private final Map<Integer, Integer> pageToStart = new HashMap<>();
@@ -51,15 +53,21 @@ final class PageMap {
 
     /** 兼容旧签名（不带页码缓存） */
     PageMap(Book book, TextPaint paint, int width, int height, float spacingAdd) {
-        this(book, paint, width, height, spacingAdd, null);
+        this(book, paint, width, height, spacingAdd, null, null);
     }
 
     PageMap(Book book, TextPaint paint, int width, int height, float spacingAdd, int[] seed) {
+        this(book, paint, width, height, spacingAdd, seed, null);
+    }
+
+    PageMap(Book book, TextPaint paint, int width, int height, float spacingAdd, int[] seed,
+            ChapterDecor decor) {
         this.book = book;
         this.paint = paint;
         this.width = width;
         this.height = height;
         this.spacingAdd = spacingAdd;
+        this.decor = decor;
         this.charCount = Math.max(1, book.charCount());
         this.prefix = new int[64];
         this.prefixLen = 0;
@@ -133,7 +141,7 @@ final class PageMap {
      */
     int endOfPage(int pageIndex) {
         int start = startOfPage(pageIndex);
-        return Paginator.measure(book, paint, start, width, height, spacingAdd).endChar;
+        return Paginator.measure(book, paint, start, width, height, spacingAdd, decor).endChar;
     }
 
     /**
@@ -202,7 +210,7 @@ final class PageMap {
     private Loc advanceTo(int page, int cursor, int target) {
         int guard = 0;
         while (guard++ < 100000) {
-            Paginator.Measure m = Paginator.measure(book, paint, cursor, width, height, spacingAdd);
+            Paginator.Measure m = Paginator.measure(book, paint, cursor, width, height, spacingAdd, decor);
             register(page, cursor);
             if (m.endChar <= cursor || m.endChar > target) {
                 return new Loc(cursor, page);
@@ -297,7 +305,7 @@ final class PageMap {
         }
         int guard = 0;
         while (page < target && guard++ < 100000) {
-            Paginator.Measure m = Paginator.measure(book, paint, cursor, width, height, spacingAdd);
+            Paginator.Measure m = Paginator.measure(book, paint, cursor, width, height, spacingAdd, decor);
             register(page, cursor);
             if (m.endChar <= cursor) {
                 // 已到末尾，页码夹到最后一页

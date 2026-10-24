@@ -34,6 +34,12 @@ public class ReaderView extends View {
 
         void onTocRequested();
 
+        /**
+         * 手机沉浸式阅读：点了正文中间三分之一，请求切换上下操作栏。
+         * 默认空实现，手表不实现也不受影响。
+         */
+        default void onChromeToggleRequested() {}
+
         /** Online sources may supply adjacent chapters; local TXT already contains the full book. */
         default void onChapterBoundary(boolean forward) {}
     }
@@ -48,10 +54,23 @@ public class ReaderView extends View {
     private static final float BOTTOM_BAR_PX = 34f;
     private static final float SIDE_INSET_PX = 8f;
 
-    /** 行高倍数：中文小说 1.3 左右既省版面又不挤 */
+    /**
+     * 手机矩形排版（opt-in，默认 false）。只有宿主 Manifest 的
+     * com.watchreader.PHONE_UI=true 时由 ReaderActivity 打开；手表没有该标志，
+     * 下面的圆屏公式、参数和触控区域保持原样。
+     */
+    private static final float PHONE_SIDE_MARGIN_DP = 20f;
+    private static final float PHONE_TOP_BAR_DP = 44f;
+    private static final float PHONE_BOTTOM_BAR_DP = 44f;
+    private static final float PHONE_BAR_TEXT_SP = 13f;
+
+    /** 行高倍数：中文小说 1.3 左右既省版面又不挤；手机可显式覆盖。 */
     private static final float LINE_HEIGHT_RATIO = 1.3f;
+    private static final float MIN_LINE_HEIGHT_MULTIPLIER = 1.0f;
+    private static final float MAX_LINE_HEIGHT_MULTIPLIER = 2.0f;
 
     private final TextPaint bodyPaint = new TextPaint(Paint.ANTI_ALIAS_FLAG | Paint.SUBPIXEL_TEXT_FLAG);
+    private final TextPaint chapterTitlePaint = new TextPaint(Paint.ANTI_ALIAS_FLAG | Paint.SUBPIXEL_TEXT_FLAG);
     private final Paint barPaint = new Paint(Paint.ANTI_ALIAS_FLAG);
     private final Paint footerPaint = new Paint(Paint.ANTI_ALIAS_FLAG);
 
@@ -112,7 +131,38 @@ public class ReaderView extends View {
 
     private int fontSize = 13;
     private float lineSpacingAdd = 6f;
+    /**
+     * 行距倍率。默认 1.3 且不设置时走原来的 legacy 公式，逐字节保持手表/旧手机行为；
+     * 手机设置页显式调用 {@link #setLineHeightMultiplier(float)} 后才使用自定义倍率。
+     */
+    private float lineHeightMultiplier = LINE_HEIGHT_RATIO;
+    private boolean customLineHeight;
     private String fontFamily = "sans-serif";
+    private boolean phoneLayout;
+    /**
+     * 手机页面用 Mochi 顶栏/底栏时隐藏本 View 自绘的页眉页脚，并把它们占的高度还给正文。
+     * 只对 phoneLayout 生效；手表路径不读这个标志。
+     */
+    private boolean chromeVisible = true;
+
+    /**
+     * 手机章节排版（opt-in，默认 false）：章标题独占页首、放大绘制，并在章首强制换页。
+     * 预留行数参与 Paginator/PageMap/countPages，缓存 key 也会区分，手表不打开。
+     */
+    private boolean chapterLayout;
+    private ChapterDecor chapterDecor;
+    private String standaloneTitle;
+
+    /** 在线章节的标题来自元信息，正文偏移不添加标题前缀，继续与段落同步坐标一致。 */
+    public void setStandaloneChapterTitle(String title) {
+        standaloneTitle = title;
+        chapterDecor = null;
+    }
+    /** 手机正文上下留白（dp），chrome 隐藏时生效；默认 10dp 与旧手机分支一致 */
+    private float phoneContentTopDp = 10f;
+    private float phoneContentBottomDp = 10f;
+    /** 手机沉浸式：中间三分之一点击切换操作栏；默认 false，手表不读 */
+    private boolean immersiveTap;
 
     private float textLeft;
     private float textTop;
@@ -158,6 +208,139 @@ public class ReaderView extends View {
         this.listener = listener;
     }
 
+    /**
+     * 显式手机矩形排版开关，默认 false（圆屏弦长公式）。必须在 setBook()/restoreTo()
+     * 之前设置；装载后再切换会作废页码映射并按当前位置重排，供旋转等场景兜底。
+     */
+    public void setPhoneLayout(boolean enabled) {
+        if (phoneLayout == enabled) {
+            return;
+        }
+        phoneLayout = enabled;
+        if (book != null) {
+            resetPageMap();
+            reflowFromCurrent();
+        } else {
+            requestLayout();
+            invalidate();
+        }
+    }
+
+    public boolean isPhoneLayout() {
+        return phoneLayout;
+    }
+
+    /**
+     * 隐藏自绘页眉页脚（手机工程用 Mochi 顶栏/底栏替代）。默认 true = 保持原有绘制。
+     * 必须在 setBook()/restoreTo() 之前设置；之后切换会按当前位置重排，和 setPhoneLayout 一致。
+     */
+    public void setChromeVisible(boolean visible) {
+        if (chromeVisible == visible) {
+            return;
+        }
+        chromeVisible = visible;
+        ensureMetrics(getWidth(), getHeight());
+        if (book != null) {
+            resetPageMap();
+            reflowFromCurrent();
+        }
+        invalidate();
+    }
+
+    public boolean isChromeVisible() {
+        return chromeVisible;
+    }
+
+    /** 当前已应用的颜色，避免 Compose update 每次重组都重复 invalidate */
+    private int readingBackground = BG;
+    private int readingBody = BODY;
+    private int readingBar = BAR_TEXT;
+    private int readingFooter = FOOTER_TEXT;
+
+    /**
+     * 正文配色（手机 Mochi 主题用）。不传就是原来的手表暗色，手表路径从不调用这里。
+     * 只改颜色，不改字号/间距，所以不会重排，也不会让页码缓存失效。
+     *
+     * @param background 正文页底色
+     * @param bodyText   正文字色
+     * @param barText    页眉/页码色（chromeVisible=false 时不绘制，仍保留给兜底）
+     * @param footerText 页脚翻页提示色
+     */
+    public void setReadingColors(int background, int bodyText, int barText, int footerText) {
+        if (background == readingBackground && bodyText == readingBody
+                && barText == readingBar && footerText == readingFooter) {
+            return;
+        }
+        readingBackground = background;
+        readingBody = bodyText;
+        readingBar = barText;
+        readingFooter = footerText;
+        setBackgroundColor(background);
+        bodyPaint.setColor(bodyText);
+        barPaint.setColor(barText);
+        footerPaint.setColor(footerText);
+        invalidate();
+    }
+
+    /**
+     * 手机章节排版开关（默认 false = 旧版）。打开后：章首独占一页、标题放大、
+     * 预留高度参与真实分页测量，缓存 key 也会变。必须在 setBook 之前设置；
+     * 装载后切换会作废页码映射并按当前位置重排。
+     */
+    public void setChapterLayout(boolean enabled) {
+        if (chapterLayout == enabled) {
+            return;
+        }
+        chapterLayout = enabled;
+        if (book != null) {
+            chapters = null;          // 重新扫描并重建装饰
+            chapterDecor = null;
+            resetPageMap();
+            reflowFromCurrent();
+        }
+    }
+
+    public boolean isChapterLayout() {
+        return chapterLayout;
+    }
+
+    /**
+     * 手机正文上下留白（dp）。沉浸模式下由 Mochi 信息条/底栏覆盖，正文需要让出固定高度，
+     * 但**只在打开时算一次**：开关操作栏不改变这里的值，所以不会重新分页。
+     */
+    public void setPhoneContentInsets(float topDp, float bottomDp) {
+        float top = Math.max(0f, topDp);
+        float bottom = Math.max(0f, bottomDp);
+        if (top == phoneContentTopDp && bottom == phoneContentBottomDp) {
+            return;
+        }
+        phoneContentTopDp = top;
+        phoneContentBottomDp = bottom;
+        ensureMetrics(getWidth(), getHeight());
+        if (book != null) {
+            resetPageMap();
+            reflowFromCurrent();
+        }
+    }
+
+    /** 手机沉浸式：点正文中间三分之一切换上下操作栏（默认关闭，手表不打开）。 */
+    public void setImmersiveTap(boolean enabled) {
+        immersiveTap = enabled;
+    }
+
+    /** 当前页是不是"章首页"（顶部有放大的章节标题）。 */
+    public boolean isChapterStartPage() {
+        return current != null && current.topRows > 0;
+    }
+
+    private float density() {
+        return getResources().getDisplayMetrics().density;
+    }
+
+    private float scaledDensity() {
+        return getResources().getDisplayMetrics().scaledDensity;
+    }
+
     public void setBook(Book book) {
         resetPageCount();
         this.book = book;
@@ -165,6 +348,7 @@ public class ReaderView extends View {
         this.pendingEnd = false;
         this.ready = false;
         this.chapters = null;
+        this.chapterDecor = null;
         this.pageIndex = 0;
         this.current = null;
         this.pageMap = null;
@@ -177,6 +361,7 @@ public class ReaderView extends View {
     private void resetPageMap() {
         pageMap = null;
         pageMapKey = null;
+        chapterDecor = null;
         resetPageCount();
     }
 
@@ -194,13 +379,14 @@ public class ReaderView extends View {
         final TextPaint paint = new TextPaint(bodyPaint);
         final int width = (int) textWidth, height = (int) textHeight;
         final float spacing = lineSpacingAdd;
+        final ChapterDecor decor = chapterDecoration();
         final int version = pageCountGeneration, start = current.startChar, basePage = pageIndex, end = contentEnd();
         pageCounter = new Thread(() -> {
             android.os.Process.setThreadPriority(android.os.Process.THREAD_PRIORITY_BACKGROUND);
             int cursor = start, count = 0;
             while (cursor < end) {
                 if (Thread.currentThread().isInterrupted()) return;
-                Paginator.Measure measured = Paginator.measure(snapshot, paint, cursor, width, height, spacing);
+                Paginator.Measure measured = Paginator.measure(snapshot, paint, cursor, width, height, spacing, decor);
                 if (measured.endChar <= cursor) return;
                 cursor = measured.endChar;
                 count++;
@@ -236,7 +422,7 @@ public class ReaderView extends View {
             pageMapKey = layoutKey();
             // 复用上次落盘的页码起点（版面没变就不用重新量）；源文件已变时 load 会返回 null
             int[] seed = PageIndexCache.load(pageCacheDir, book, pageMapKey);
-            pageMap = new PageMap(book, bodyPaint, (int) textWidth, (int) textHeight, lineSpacingAdd, seed);
+            pageMap = new PageMap(book, bodyPaint, (int) textWidth, (int) textHeight, lineSpacingAdd, seed, chapterDecoration());
         }
         return pageMap;
     }
@@ -248,7 +434,8 @@ public class ReaderView extends View {
      */
     private String layoutKey() {
         return fontSize + "|" + fontFamily + "|" + bodyPaint.getTextSize()
-                + "|" + (int) textWidth + "|" + (int) textHeight + "|" + lineSpacingAdd;
+                + "|" + (int) textWidth + "|" + (int) textHeight + "|" + lineSpacingAdd
+                + (chapterLayout ? "|chapter-v1" : "");
     }
 
     /** 页码缓存目录（App 私有 index 目录）；不设置就不启用页码缓存 */
@@ -297,6 +484,48 @@ public class ReaderView extends View {
         bodyPaint.setTypeface(android.graphics.Typeface.create(fontFamily, android.graphics.Typeface.NORMAL));
         resetPageMap();
         reflowFromCurrent();
+    }
+
+    /**
+     * 手机 opt-in：设置行距倍率（1.0–2.0）。默认不调用，仍走旧的 1.3 公式；
+     * 倍率会参与 Paginator.measure、PageMap、chapterDecor 行数、绘制行高与 layoutKey。
+     * 修改后按当前页起始字符重排；改字号/字体不会重置这里设置的值。
+     */
+    public void setLineHeightMultiplier(float multiplier) {
+        if (Float.isNaN(multiplier)) {
+            return;
+        }
+        float clamped = Math.max(MIN_LINE_HEIGHT_MULTIPLIER,
+                Math.min(MAX_LINE_HEIGHT_MULTIPLIER, multiplier));
+        if (!customLineHeight && Math.abs(clamped - LINE_HEIGHT_RATIO) < 0.0005f) {
+            // 首次设置默认值：保持 legacy 公式和原 layoutKey，不触发一次无意义重排。
+            lineHeightMultiplier = LINE_HEIGHT_RATIO;
+            return;
+        }
+        if (customLineHeight && Math.abs(clamped - lineHeightMultiplier) < 0.0005f) {
+            return;
+        }
+        customLineHeight = true;
+        lineHeightMultiplier = clamped;
+        applyFontMetrics();
+        resetPageMap();
+        reflowFromCurrent();
+        requestLayout();
+        invalidate();
+    }
+
+    public float getLineHeightMultiplier() {
+        return lineHeightMultiplier;
+    }
+
+    /** 测试用：与 PageIndexCache 实际使用的 layoutKey 一致。 */
+    String layoutKeyForTest() {
+        return layoutKey();
+    }
+
+    /** 测试用：实际传给 Paginator/绘制行高的 lineSpacingAdd。 */
+    float lineSpacingAddForTest() {
+        return lineSpacingAdd;
     }
 
     public int getCharOffset() {
@@ -370,6 +599,22 @@ public class ReaderView extends View {
         loadPage(charOffset);
     }
 
+    /** 供外部 UI（手机底栏）翻页：与点击、滑动走同一条 flip 路径。 */
+    public void turnPage(boolean forward) {
+        turnPage(forward, false);
+    }
+
+    /**
+     * @param immediate true 时跳过 90ms 输入合并，供底部“一划多页”手势按阈值连续调用；
+     *                  仍逐页走 PageMap/flip，坐标与页码缓存不受影响。
+     */
+    public void turnPage(boolean forward, boolean immediate) {
+        if (immediate) {
+            lastFlipAt = 0L;
+        }
+        flip(forward);
+    }
+
     private int pendingStart = -1;
     private boolean pendingEnd;
 
@@ -386,7 +631,12 @@ public class ReaderView extends View {
 
     private void applyFontMetrics() {
         bodyPaint.setTextSize(fontSize * getResources().getDisplayMetrics().scaledDensity);
-        lineSpacingAdd = Math.max(1f, fontSize * LINE_HEIGHT_RATIO - fontSize);
+        if (!customLineHeight) {
+            // 默认路径保持旧公式，避免默认版面/页码缓存相对手表发生任何变化。
+            lineSpacingAdd = Math.max(1f, fontSize * LINE_HEIGHT_RATIO - fontSize);
+        } else {
+            lineSpacingAdd = Math.max(1f, fontSize * (lineHeightMultiplier - 1f));
+        }
     }
 
     /**
@@ -394,6 +644,10 @@ public class ReaderView extends View {
      * 顶栏/底栏越靠近上下端，弦越短，所以它们不能按正文宽度铺满，否则箭头会贴到弧线上。
      */
     private float chordWidthAt(float y) {
+        if (phoneLayout) {
+            // 矩形屏：左右各留 20dp，菜单/顶栏/底栏共用同一条可用宽度
+            return Math.max(0f, getWidth() - 2f * PHONE_SIDE_MARGIN_DP * density());
+        }
         float diameter = Math.min(getWidth(), getHeight());
         if (diameter <= 0) {
             return 0f;
@@ -420,6 +674,26 @@ public class ReaderView extends View {
         if (w <= 0 || h <= 0) {
             return;
         }
+
+        if (phoneLayout) {
+            float d = density();
+            float side = PHONE_SIDE_MARGIN_DP * d;
+            // chromeVisible=false：页眉页脚由 Mochi 顶栏/底栏接管，正文只留很小的上下内边距
+            float topInset = chromeVisible ? (PHONE_TOP_BAR_DP + 6f) * d : phoneContentTopDp * d;
+            float bottomInset = chromeVisible ? (PHONE_BOTTOM_BAR_DP + 4f) * d : phoneContentBottomDp * d;
+            textTop = topInset;
+            float footerTop = h - bottomInset;
+            textHeight = Math.max(40f, footerTop - textTop);
+            textWidth = Math.max(80f, w - side * 2f);
+            textLeft = side;
+            barPaint.setTextSize(PHONE_BAR_TEXT_SP * scaledDensity());
+            footerPaint.setTextSize(PHONE_BAR_TEXT_SP * scaledDensity());
+            headerBaseline = 30f * d;
+            footerBaseline = h - 14f * d;
+            return;
+        }
+        barPaint.setTextSize(20f);
+        footerPaint.setTextSize(20f);
 
         float diameter = Math.min(w, h);
         float radius = diameter / 2f;
@@ -476,10 +750,10 @@ public class ReaderView extends View {
             }
 
             Paginator.Page page = Paginator.paginateAt(book, bodyPaint, startChar,
-                    (int) textWidth, (int) textHeight, lineSpacingAdd);
+                    (int) textWidth, (int) textHeight, lineSpacingAdd, chapterDecoration());
             current = page;
             if (exactPages < 0) estimatedPages = Paginator.estimatePageCount(book, bodyPaint,
-                    (int) textWidth, (int) textHeight, lineSpacingAdd);
+                    (int) textWidth, (int) textHeight, lineSpacingAdd, chapterDecoration());
 
             PageMap map = pageMap();
             if (map != null) {
@@ -608,24 +882,44 @@ public class ReaderView extends View {
             return;
         }
 
+        boolean drawChrome = !phoneLayout || chromeVisible;
+
         // 顶栏：章节名（优先）/书名 + 百分比
-        String header = currentChapterTitle();
-        if (TextUtils.isEmpty(header)) {
-            header = book.title;
+        if (drawChrome) {
+            String header = currentChapterTitle();
+            if (TextUtils.isEmpty(header)) {
+                header = book.title;
+            }
+            // 顶栏也要服从圆形边界：该高度处的弦长才是真正可用的横向空间
+            float headerSafe = Math.max(60f, chordWidthAt(headerBaseline) - 12f);
+            float headerLeft = (getWidth() - headerSafe) / 2f;
+            String percent = Math.round(getPercent()) + "%";
+            float percentWidth = barPaint.measureText(percent);
+            canvas.drawText(ellipsize(header, barPaint, headerSafe - percentWidth - 10f),
+                    headerLeft, headerBaseline, barPaint);
+            canvas.drawText(percent, getWidth() - headerLeft - percentWidth, headerBaseline, barPaint);
         }
-        // 顶栏也要服从圆形边界：该高度处的弦长才是真正可用的横向空间
-        float headerSafe = Math.max(60f, chordWidthAt(headerBaseline) - 12f);
-        float headerLeft = (getWidth() - headerSafe) / 2f;
-        String percent = Math.round(getPercent()) + "%";
-        float percentWidth = barPaint.measureText(percent);
-        canvas.drawText(ellipsize(header, barPaint, headerSafe - percentWidth - 10f),
-                headerLeft, headerBaseline, barPaint);
-        canvas.drawText(percent, getWidth() - headerLeft - percentWidth, headerBaseline, barPaint);
 
         // 正文：逐行绘制
         float lineHeight = Paginator.lineHeightOf(bodyPaint, lineSpacingAdd);
         Paint.FontMetrics fm = bodyPaint.getFontMetrics();
         float baseline = textTop - fm.top;
+        if (current.topRows > 0) {
+            TextPaint headingPaint = headingPaint();
+            float headingHeight = Paginator.lineHeightOf(headingPaint, lineSpacingAdd);
+            float titleY = textTop - headingPaint.getFontMetrics().top;
+            for (String titleLine : headingLines(currentChapterTitle(), headingPaint)) {
+                canvas.drawText(titleLine, textLeft, titleY, headingPaint);
+                titleY += headingHeight;
+            }
+            Paint rule = new Paint(Paint.ANTI_ALIAS_FLAG);
+            rule.setColor(readingBar);
+            rule.setAlpha(70);
+            rule.setStrokeWidth(density());
+            float ruleY = textTop + (current.topRows - 0.6f) * lineHeight;
+            canvas.drawLine(textLeft, ruleY, textLeft + textWidth, ruleY, rule);
+            baseline += current.topRows * lineHeight;
+        }
         String[] texts = current.lineTexts;
         for (int i = 0; i < texts.length; i++) {
             String line = texts[i];
@@ -640,13 +934,15 @@ public class ReaderView extends View {
         }
 
         // 底栏：翻页提示 + 页码
-        float footerSafe = Math.max(60f, chordWidthAt(footerBaseline) - 12f);
-        float footerLeft = (getWidth() - footerSafe) / 2f;
-        canvas.drawText("‹", footerLeft + SIDE_INSET_PX, footerBaseline, footerPaint);
-        canvas.drawText("›", getWidth() - footerLeft - footerPaint.measureText("›") - SIDE_INSET_PX,
-                footerBaseline, footerPaint);
-        String footer = (pageIndex + 1) + "/" + (isPageCountExact() ? getPageCount() : "…");
-        canvas.drawText(footer, (getWidth() - footerPaint.measureText(footer)) / 2f, footerBaseline, footerPaint);
+        if (drawChrome) {
+            float footerSafe = Math.max(60f, chordWidthAt(footerBaseline) - 12f);
+            float footerLeft = (getWidth() - footerSafe) / 2f;
+            canvas.drawText("‹", footerLeft + SIDE_INSET_PX, footerBaseline, footerPaint);
+            canvas.drawText("›", getWidth() - footerLeft - footerPaint.measureText("›") - SIDE_INSET_PX,
+                    footerBaseline, footerPaint);
+            String footer = (pageIndex + 1) + "/" + (isPageCountExact() ? getPageCount() : "…");
+            canvas.drawText(footer, (getWidth() - footerPaint.measureText(footer)) / 2f, footerBaseline, footerPaint);
+        }
 
         // 菜单浮层画在最上面
         if (menuOpen) {
@@ -976,6 +1272,21 @@ public class ReaderView extends View {
         float h = getHeight();
         float diameter = Math.min(w, h);
 
+        if (phoneLayout) {
+            float d = density();
+            float rowH = menuRowHeight();
+            int rows = Math.min(menuItems.size(), MENU_MAX_ROWS);
+            float panelH = Math.min(h * 0.90f, rowH * (rows + 1.15f));
+            float margin = 24f * d;
+            float top = Math.max(margin, (h - panelH) / 2f);
+            if (top + panelH > h - margin) {
+                panelH = Math.max(rowH * 2f, h - margin - top);
+            }
+            float panelW = Math.max(Math.min(120f, w), Math.min(w - 2f * PHONE_SIDE_MARGIN_DP * d, w));
+            float left = (w - panelW) / 2f;
+            return new float[] { left, top, left + panelW, top + panelH };
+        }
+
         float rowH = menuRowHeight();
         int rows = Math.min(menuItems.size(), MENU_MAX_ROWS);
         // +1 行给标题
@@ -1011,6 +1322,10 @@ public class ReaderView extends View {
 
     /** 底部"确定"按钮占的高度 */
     private float menuFooterHeight() {
+        if (phoneLayout) {
+            float d = density();
+            return Math.max(44f * d, Math.min(56f * d, getHeight() * 0.10f));
+        }
         return Math.max(32f, Math.min(46f, getHeight() * 0.10f));
     }
 
@@ -1023,6 +1338,10 @@ public class ReaderView extends View {
 
     private float menuRowHeight() {
         float h = getHeight();
+        if (phoneLayout) {
+            float d = density();
+            return Math.max(44f * d, Math.min(56f * d, h * 0.078f));
+        }
         return Math.max(30f, Math.min(44f, h * 0.078f));
     }
 
@@ -1042,18 +1361,19 @@ public class ReaderView extends View {
         // 标题行：左边标题，右边"第几项/共几项"
         Paint titlePaint = new Paint(Paint.ANTI_ALIAS_FLAG);
         titlePaint.setColor(0xFF8394AB);
-        titlePaint.setTextSize(17f);
+        titlePaint.setTextSize(phoneLayout ? 13f * scaledDensity() : 17f);
         titlePaint.setTextAlign(Paint.Align.LEFT);
         Paint counterPaint = new Paint(Paint.ANTI_ALIAS_FLAG);
         counterPaint.setColor(0xFF8394AB);
-        counterPaint.setTextSize(15f);
+        counterPaint.setTextSize(phoneLayout ? 12f * scaledDensity() : 15f);
         counterPaint.setTextAlign(Paint.Align.RIGHT);
 
+        float titlePad = phoneLayout ? 16f * density() : 14f;
         String counter = (menuSelected + 1) + "/" + menuItems.size();
         float counterW = counterPaint.measureText(counter);
-        canvas.drawText(ellipsize(menuTitle, titlePaint, b[2] - b[0] - counterW - 34f),
-                b[0] + 14f, b[1] + titleH * 0.78f, titlePaint);
-        canvas.drawText(counter, b[2] - 14f, b[1] + titleH * 0.78f, counterPaint);
+        canvas.drawText(ellipsize(menuTitle, titlePaint, b[2] - b[0] - counterW - titlePad * 2f - 6f),
+                b[0] + titlePad, b[1] + titleH * 0.78f, titlePaint);
+        canvas.drawText(counter, b[2] - titlePad, b[1] + titleH * 0.78f, counterPaint);
 
         float listTop = b[1] + titleH;
         float listBottom = b[3] - footerH;
@@ -1067,8 +1387,9 @@ public class ReaderView extends View {
         Paint selPaint = new Paint(Paint.ANTI_ALIAS_FLAG);
         selPaint.setColor(0xFF1D2C47);
         Paint textPaint = new Paint(Paint.ANTI_ALIAS_FLAG);
-        textPaint.setTextSize(20f);
+        textPaint.setTextSize(phoneLayout ? 16f * scaledDensity() : 20f);
         textPaint.setTextAlign(Paint.Align.CENTER);
+        float rowTextInset = phoneLayout ? 32f * density() : 40f;
 
         canvas.save();
         canvas.clipRect(b[0], listTop, b[2], listBottom);
@@ -1082,7 +1403,7 @@ public class ReaderView extends View {
                         8f, 8f, selPaint);
             }
             textPaint.setColor(i == menuSelected ? 0xFF4C8DFF : 0xFFE6EDF5);
-            canvas.drawText(ellipsize(menuItems.get(i).label, textPaint, b[2] - b[0] - 40f),
+            canvas.drawText(ellipsize(menuItems.get(i).label, textPaint, b[2] - b[0] - rowTextInset),
                     (b[0] + b[2]) / 2f, rowTop + rowH * 0.68f, textPaint);
         }
         canvas.restore();
@@ -1092,10 +1413,11 @@ public class ReaderView extends View {
         // 确认按钮：表冠只能"选"，需要一个明确的"执行"入口
         Paint btnBg = new Paint(Paint.ANTI_ALIAS_FLAG);
         btnBg.setColor(0xFF1D2C47);
-        float btnLeft = b[0] + 12f;
-        float btnRight = b[2] - 12f;
-        float btnTop = b[3] - footerH + 5f;
-        float btnBottom = b[3] - 6f;
+        float btnInset = phoneLayout ? 14f * density() : 12f;
+        float btnLeft = b[0] + btnInset;
+        float btnRight = b[2] - btnInset;
+        float btnTop = b[3] - footerH + (phoneLayout ? 6f * density() : 5f);
+        float btnBottom = b[3] - (phoneLayout ? 6f * density() : 6f);
         canvas.drawRoundRect(btnLeft, btnTop, btnRight, btnBottom, 9f, 9f, btnBg);
 
         // 菜单里有"确定/确认"这类项时，按钮以它为准，避免语义重叠
@@ -1105,7 +1427,7 @@ public class ReaderView extends View {
                 : "确定";
         Paint btnText = new Paint(Paint.ANTI_ALIAS_FLAG);
         btnText.setColor(0xFF4C8DFF);
-        btnText.setTextSize(19f);
+        btnText.setTextSize(phoneLayout ? 15f * scaledDensity() : 19f);
         btnText.setTextAlign(Paint.Align.CENTER);
         canvas.drawText(ellipsize(confirmLabel, btnText, btnRight - btnLeft - 16f),
                 (btnLeft + btnRight) / 2f, btnTop + (btnBottom - btnTop) * 0.72f, btnText);
@@ -1349,6 +1671,15 @@ public class ReaderView extends View {
     private long downTime;
     private boolean longPressFired;
 
+    /** 底部“页码/设置”点击区：手机与底栏同高，手表保持原来的 90px */
+    private float footerTouchTop() {
+        if (phoneLayout) {
+            // 自绘底栏已隐藏时，底部不再有“点页码打开设置”的区域（设置改由 Mochi 底栏负责）
+            return chromeVisible ? getHeight() - (PHONE_BOTTOM_BAR_DP + 4f) * density() : getHeight() + 1f;
+        }
+        return getHeight() - 90f;
+    }
+
     private final Runnable longPressRunnable = new Runnable() {
         @Override
         public void run() {
@@ -1411,7 +1742,12 @@ public class ReaderView extends View {
                 }
 
                 if (dt < 350 && Math.abs(dx) < 24f && Math.abs(dy) < 24f) {
-                    if (event.getY() > getHeight() - 90f) {
+                    if (phoneLayout && immersiveTap && event.getX() >= getWidth() / 3f
+                            && event.getX() <= getWidth() * 2f / 3f) {
+                        if (listener != null) listener.onChromeToggleRequested();
+                        return true;
+                    }
+                    if (event.getY() > footerTouchTop()) {
                         if (listener != null) {
                             listener.onSeekRequested();
                         }
@@ -1430,10 +1766,60 @@ public class ReaderView extends View {
         }
     }
 
+    private TextPaint headingPaint() {
+        TextPaint paint = new TextPaint(bodyPaint);
+        paint.setTextSize(bodyPaint.getTextSize() * 1.3f);
+        paint.setTypeface(android.graphics.Typeface.create(bodyPaint.getTypeface(), android.graphics.Typeface.BOLD));
+        return paint;
+    }
+
+    private List<String> headingLines(String title, TextPaint paint) {
+        List<String> lines = new ArrayList<>();
+        if (title == null) return lines;
+        int offset = 0;
+        while (offset < title.length()) {
+            int count = Math.max(1, paint.breakText(title, offset, title.length(), true, Math.max(1f, textWidth), null));
+            int end = Math.min(title.length(), offset + count);
+            if (end < title.length() && end > offset && Character.isHighSurrogate(title.charAt(end - 1))) end--;
+            if (end <= offset) end = Math.min(title.length(), offset + 2);
+            lines.add(title.substring(offset, end));
+            offset = end;
+        }
+        return lines;
+    }
+
+    private ChapterDecor chapterDecoration() {
+        if (!phoneLayout || !chapterLayout || book == null) return null;
+        if (standaloneTitle != null && chapterDecor == null) {
+            TextPaint titlePaint = headingPaint();
+            float bodyHeight = Math.max(1f, Paginator.lineHeightOf(bodyPaint, lineSpacingAdd));
+            int rows = (int) Math.ceil(headingLines(standaloneTitle, titlePaint).size()
+                    * Paginator.lineHeightOf(titlePaint, lineSpacingAdd) / bodyHeight) + 1;
+            chapterDecor = new ChapterDecor(new int[]{0}, new int[]{rows}, false);
+        }
+        if (standaloneTitle != null) return chapterDecor;
+        if (chapters == null) chapters = Chapters.scan(book.text);
+        if (chapterDecor == null && !chapters.isEmpty()) {
+            int[] starts = new int[chapters.size()];
+            int[] rows = new int[chapters.size()];
+            TextPaint titlePaint = headingPaint();
+            float bodyHeight = Math.max(1f, Paginator.lineHeightOf(bodyPaint, lineSpacingAdd));
+            float titleHeight = Paginator.lineHeightOf(titlePaint, lineSpacingAdd);
+            for (int i = 0; i < starts.length; i++) {
+                Chapters.Chapter c = chapters.get(i);
+                starts[i] = c.offset;
+                rows[i] = (int) Math.ceil(headingLines(c.title, titlePaint).size() * titleHeight / bodyHeight) + 1;
+            }
+            chapterDecor = new ChapterDecor(starts, rows);
+        }
+        return chapterDecor;
+    }
+
     // ---------------- 章节 ----------------
     // 识别逻辑在 Chapters.java（纯逻辑，桌面可测）；这里只负责缓存与展示。
 
-    private String currentChapterTitle() {
+    public String currentChapterTitle() {
+        if (standaloneTitle != null) return standaloneTitle;
         if (chapters == null || chapters.isEmpty() || current == null) {
             return null;
         }

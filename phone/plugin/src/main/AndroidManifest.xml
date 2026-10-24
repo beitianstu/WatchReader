@@ -1,0 +1,49 @@
+<?xml version="1.0" encoding="utf-8"?>
+<manifest xmlns:android="http://schemas.android.com/apk/res/android">
+
+    <supports-screens
+        android:anyDensity="true"
+        android:largeScreens="true"
+        android:normalScreens="true"
+        android:resizeable="true"
+        android:smallScreens="true"
+        android:xlargeScreens="true" />
+
+    <uses-permission android:name="android.permission.INTERNET" />
+
+    <uses-feature
+        android:name="android.hardware.type.watch"
+        android:required="false" />
+
+    <!-- 与手表插件保持同一 applicationId / authority / 证书，主程序的 pin 与调用方校验不变 -->
+    <application
+        android:allowBackup="false"
+        android:fullBackupContent="false"
+        android:icon="@drawable/ic_launcher"
+        android:label="WatchReader 番茄插件"
+        android:supportsRtl="false"
+        android:theme="@android:style/Theme.Material.Light.NoActionBar"
+        android:usesCleartextTraffic="false">
+
+        <provider
+            android:name=".FanqieProvider"
+            android:authorities="com.watchreader.fanqie.source"
+            android:exported="true"
+            android:grantUriPermissions="false" />
+
+        <!-- 真实 target 必须先声明；旧组件名通过 alias 指向 Mochi 版，保持显式 Intent ABI 不变 -->
+        <activity
+            android:name=".MochiPluginSetupActivity"
+            android:configChanges="orientation|screenSize|keyboardHidden|uiMode"
+            android:exported="false"
+            android:windowSoftInputMode="adjustResize" />
+
+        <activity-alias
+            android:name="com.watchreader.fanqie.PluginSetupActivity"
+            android:configChanges="orientation|screenSize|keyboardHidden|uiMode"
+            android:enabled="true"
+            android:exported="true"
+            android:targetActivity=".MochiPluginSetupActivity"
+            android:windowSoftInputMode="adjustResize" />
+    </application>
+</manifest>
